@@ -415,13 +415,8 @@ func (s *messageBoardServer) GetClusterState(ctx context.Context, _ *emptypb.Emp
 	}, nil
 }
 
-<<<<<<< HEAD
 // GetSubscriptionNode vrne node, na katerega naj se klient naroči in generira subscribe_token, ki ga bo kasneje preveril SubscribeTopic.
 func (s *messageBoardServer) GetSubscriptionNode(ctx context.Context, request *pb.SubscriptionNodeRequest) (*pb.SubscriptionNodeResponse, error) {
-=======
-// GetSubcscriptionNode vrne node, na katerega naj se klient naroči in generira subscribe_token, ki ga bo kasneje preveril SubscribeTopic.
-func (s *messageBoardServer) GetSubcscriptionNode(ctx context.Context, request *pb.SubscriptionNodeRequest) (*pb.SubscriptionNodeResponse, error) {
->>>>>>> 6dc4dddf300e68f19d006c67dee39cdff077e047
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
@@ -444,11 +439,7 @@ func (s *messageBoardServer) GetSubcscriptionNode(ctx context.Context, request *
 }
 
 // SubscribeTopic odpre stream dogodkov za izbrane topice.
-<<<<<<< HEAD
 // Uporabi subscribe_token, ki ga je prej vrnil GetSubscriptionNode.
-=======
-// Uporabi subscribe_token, ki ga je prej vrnil GetSubcscriptionNode.
->>>>>>> 6dc4dddf300e68f19d006c67dee39cdff077e047
 func (s *messageBoardServer) SubscribeTopic(request *pb.SubscribeTopicRequest, stream pb.MessageBoard_SubscribeTopicServer) error {
 	//preverimo token in pripravimo subscription pod Lockom
 	s.lock.Lock()
