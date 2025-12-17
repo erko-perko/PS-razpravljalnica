@@ -38,12 +38,19 @@ func main() {
 
 	done := make(chan bool)
 
-	fmt.Println("\nCreating user.")
+	fmt.Println("\nCreating user ID=1.")
 	user, err := grpcClient.CreateUser(contextCRUD, &pb.CreateUserRequest{Name: "janez"})
 	if err != nil {
 		panic(err)
 	}
 	fmt.Printf("Created user: %v (ID: %v)\n", user.Name, user.Id)
+
+	fmt.Println("\nCreating user ID=2.")
+	user1, err := grpcClient.CreateUser(contextCRUD, &pb.CreateUserRequest{Name: "Miha"})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("Created user: %v (ID: %v)\n", user1.Name, user1.Id)
 
 	time.Sleep(time.Second)
 
@@ -189,6 +196,45 @@ func main() {
 		panic(err)
 	}
 	fmt.Println("Message3 liked.")
+
+	time.Sleep(time.Second)
+
+	fmt.Println("\nPrinting messages.")
+	messagesTopic2, err := grpcClient.GetMessages(contextCRUD, &pb.GetMessagesRequest{TopicId: topic2.Id, FromMessageId: 0, Limit: 0})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("Messages in topic 2:")
+	for _, message := range messagesTopic2.Messages {
+		fmt.Printf("- %v (ID: %v, Likes: %v)\n", message.Text, message.Id, message.Likes)
+	}
+
+	time.Sleep(time.Second)
+
+	fmt.Println("\nSubscribing to topics.")
+	subNode1, err := grpcClient.GetSubscriptionNode(contextCRUD, &pb.SubscriptionNodeRequest{UserId: user1.Id, TopicId: []int64{topic1.Id, topic2.Id}})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("Subscribed to topics with token: %v\n", subNode1.SubscribeToken)
+
+	go func() {
+		defer func() { done <- true }()
+
+		fmt.Println("\nStarting to listen for new messages...")
+		if stream, err := grpcClient.SubscribeTopic(contextCRUD, &pb.SubscribeTopicRequest{TopicId: []int64{topic1.Id, topic2.Id}, UserId: user1.Id, FromMessageId: 0, SubscribeToken: subNode1.SubscribeToken}); err != nil {
+			panic(err)
+		} else {
+			for {
+				messageEvent, err := stream.Recv()
+				if err != nil {
+					fmt.Printf("Error receiving message event: %v\n", err)
+					return
+				}
+				fmt.Printf("\n%v %v: Num: %v Id: %v\n", messageEvent.EventAt.AsTime().Format("2006-01-02 15:04:05"), messageEvent.Op, messageEvent.SequenceNumber, messageEvent.Message.Id)
+			}
+		}
+	}()
 
 	time.Sleep(time.Second)
 
