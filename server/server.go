@@ -54,13 +54,14 @@ type messageBoardServer struct {
 	// števci za generiranje ID-jev
 	nextUserID    int64
 	nextTopicID   int64
-	nextMessageID int64
+	nextMessageID map[int64]int64 //messagei bodo imeli svoj ID glede na topic, vsak topic se začne z messageId = 0
 
 	// identiteta tega vozlišča (za ControlPlane)
 	nodeID  string
 	address string
 
 	// naročnina
+	postEvents  map[int64]map[int64]*pb.MessageEvent
 	subscribers map[int64]*subscription
 	nextSubID   int64
 	nextSeq     int64
@@ -180,6 +181,14 @@ func (s *messageBoardServer) CreateTopic(ctx context.Context, request *pb.Create
 		s.messages[id] = make(map[int64]*pb.Message)
 	}
 
+	if _, ok := s.nextMessageID[id]; !ok {
+		s.nextMessageID[id] = 0
+	}
+
+	if _, ok := s.postEvents[id]; !ok {
+		s.postEvents[id] = make(map[int64]*pb.MessageEvent)
+	}
+
 	return topic, nil
 }
 
@@ -225,9 +234,12 @@ func (s *messageBoardServer) PostMessage(ctx context.Context, request *pb.PostMe
 		s.messages[request.GetTopicId()] = make(map[int64]*pb.Message)
 	}
 
+	//pridobimo topic, da povečamo števec sporočila za specifičen topic
+	topicID := request.GetTopicId()
+
 	//nov ID
-	s.nextMessageID++
-	id := s.nextMessageID
+	s.nextMessageID[topicID]++
+	id := s.nextMessageID[topicID]
 
 	message := &pb.Message{
 		Id:        id,
@@ -239,10 +251,17 @@ func (s *messageBoardServer) PostMessage(ctx context.Context, request *pb.PostMe
 	}
 
 	// shranimo v bazo
-	s.messages[request.GetTopicId()][id] = message
+	s.messages[topicID][id] = message
 
 	event := s.newMessageEvent(pb.OpType_OP_POST, message) //kreiramo event za broadcast naročnino
-	s.broadcastEvent(event)                                //sprotni broadcast vsem naročnikom
+
+	// shranimo originalni POST event za backlog
+	if _, ok := s.postEvents[topicID]; !ok {
+		s.postEvents[topicID] = make(map[int64]*pb.MessageEvent)
+	}
+	s.postEvents[topicID][id] = event
+
+	s.broadcastEvent(event) //sprotni broadcast vsem naročnikom
 
 	return message, nil
 }
@@ -495,10 +514,18 @@ func (s *messageBoardServer) SubscribeTopic(request *pb.SubscribeTopicRequest, s
 			return messages[i] < messages[j]
 		})
 
-		for _, messageID := range messages {
-			event := s.newMessageEvent(pb.OpType_OP_POST, tMessages[messageID])
-			backlog = append(backlog, event)
+		//backlog je sestavljen iz sporočil, ki smo si jih shranili v mapo
+		postEvMap, ok := s.postEvents[topicID]
+		if !ok {
+			continue
 		}
+
+		for _, messageID := range messages {
+			if ev, ok := postEvMap[messageID]; ok {
+				backlog = append(backlog, ev)
+			}
+		}
+
 	}
 
 	s.lock.Unlock()
@@ -536,13 +563,15 @@ Konstruktor
 */
 func newMessageBoardServer() *messageBoardServer {
 	return &messageBoardServer{
-		users:       make(map[int64]*pb.User),
-		topics:      make(map[int64]*pb.Topic),
-		messages:    make(map[int64]map[int64]*pb.Message),
-		tokens:      make(map[string]*SubscriptionTokenInfo),
-		subscribers: make(map[int64]*subscription),
-		nodeID:      "node-1",
-		address:     ":50051",
+		users:         make(map[int64]*pb.User),
+		topics:        make(map[int64]*pb.Topic),
+		messages:      make(map[int64]map[int64]*pb.Message),
+		nextMessageID: make(map[int64]int64),
+		postEvents:    make(map[int64]map[int64]*pb.MessageEvent),
+		tokens:        make(map[string]*SubscriptionTokenInfo),
+		subscribers:   make(map[int64]*subscription),
+		nodeID:        "node-1",
+		address:       ":50051",
 	}
 }
 
