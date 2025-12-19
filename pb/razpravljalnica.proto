@@ -86,20 +86,31 @@ service  MessageBoard{
   // Subscribe to topics; goes to the node returned by head
   rpc SubscribeTopic(SubscribeTopicRequest) returns (stream MessageEvent);
 
+  // Chain replication propagation methods (internal use between nodes)
+  rpc PropagatePost(PostMessageRequest) returns (Message);
+  rpc PropagateUpdate(UpdateMessageRequest) returns (Message);
+  rpc PropagateDelete(DeleteMessageRequest) returns (google.protobuf.Empty);
+  rpc PropagateLike(LikeMessageRequest) returns (Message);
+  rpc PropagateCreateUser(CreateUserRequest) returns (User);
+  rpc PropagateCreateTopic(CreateTopicRequest) returns (Topic);
+
 }
 
 message CreateUserRequest {
   string name = 1;
+  int64 id = 2; // Optional: for internal chain replication (0 = generate new ID)
 }
 
 message CreateTopicRequest {
   string name = 1;
+  int64 id = 2; // Optional: for internal chain replication (0 = generate new ID)
 }
 
 message PostMessageRequest {
   int64 topic_id = 1;
   int64 user_id = 2;
   string text = 3;
+  int64 message_id = 4; // Optional: for internal chain replication (0 = generate new ID)
 }
 
 message DeleteMessageRequest {
@@ -165,9 +176,14 @@ message MessageEvent {
 // Return the the head and the tail node address
 service ControlPlane {
   rpc GetClusterState(google.protobuf.Empty) returns (GetClusterStateResponse);
+  rpc ConfigureChain(ConfigureChainRequest) returns (google.protobuf.Empty);
 }
 
 message GetClusterStateResponse {
   NodeInfo head = 1;
   NodeInfo tail = 2;
+}
+
+message ConfigureChainRequest {
+  repeated NodeInfo nodes = 1; // ordered list of nodes in the chain (head to tail)
 }
