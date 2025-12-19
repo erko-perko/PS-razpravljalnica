@@ -16,37 +16,45 @@ import (
 func main() {
 	// preberemo argumente iz ukazne vrstice
 	sPtr := flag.String("s", "", "server URL")
-	pPtr := flag.Int("p", 50051, "port number")
+	hPtr := flag.Int("h", 50051, "head port number")
+	tPtr := flag.Int("t", 50053, "tail port number")
 	flag.Parse()
 
 	// zaženemo strežnik ali odjemalca
-	url := fmt.Sprintf("%v:%v", *sPtr, *pPtr)
+	headUrl := fmt.Sprintf("%v:%v", *sPtr, *hPtr)
+	tailUrl := fmt.Sprintf("%v:%v", *sPtr, *tPtr)
 
-	fmt.Printf("gRPC client connecting to %v\n", url)
-	conn, err := grpc.NewClient(url, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	fmt.Printf("gRPC client connecting to head at %v\n", headUrl)
+	headConn, err := grpc.NewClient(headUrl, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		panic(err)
 	}
-	defer conn.Close()
-
+	fmt.Printf("gRPC client connecting to tail at %v\n", tailUrl)
+	tailConn, err := grpc.NewClient(tailUrl, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		panic(err)
+	}
+	defer headConn.Close()
+	defer tailConn.Close()
 	// vzpostavimo izvajalno okolje
 	contextCRUD, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	// vzpostavimo vmesnik gRPC
-	grpcClient := pb.NewMessageBoardClient(conn)
+	grpcHeadClient := pb.NewMessageBoardClient(headConn)
+	grpcTailClient := pb.NewMessageBoardClient(tailConn)
 
 	done := make(chan bool)
 
 	fmt.Println("\nCreating user ID=1.")
-	user, err := grpcClient.CreateUser(contextCRUD, &pb.CreateUserRequest{Name: "janez"})
+	user, err := grpcHeadClient.CreateUser(contextCRUD, &pb.CreateUserRequest{Name: "janez"})
 	if err != nil {
 		panic(err)
 	}
 	fmt.Printf("Created user: %v (ID: %v)\n", user.Name, user.Id)
 
 	fmt.Println("\nCreating user ID=2.")
-	user1, err := grpcClient.CreateUser(contextCRUD, &pb.CreateUserRequest{Name: "Miha"})
+	user1, err := grpcHeadClient.CreateUser(contextCRUD, &pb.CreateUserRequest{Name: "Miha"})
 	if err != nil {
 		panic(err)
 	}
@@ -55,14 +63,14 @@ func main() {
 	time.Sleep(time.Second)
 
 	fmt.Println("\nCreating topics.")
-	topic1, err := grpcClient.CreateTopic(contextCRUD, &pb.CreateTopicRequest{Name: "Prva tema"})
+	topic1, err := grpcHeadClient.CreateTopic(contextCRUD, &pb.CreateTopicRequest{Name: "Prva tema"})
 	if err != nil {
 		panic(err)
 	}
 
 	time.Sleep(time.Second)
 
-	topic2, err := grpcClient.CreateTopic(contextCRUD, &pb.CreateTopicRequest{Name: "Druga tema"})
+	topic2, err := grpcHeadClient.CreateTopic(contextCRUD, &pb.CreateTopicRequest{Name: "Druga tema"})
 	if err != nil {
 		panic(err)
 	}
@@ -71,7 +79,7 @@ func main() {
 	time.Sleep(time.Second)
 
 	fmt.Println("\nListing topics.")
-	topics, err := grpcClient.ListTopics(contextCRUD, &emptypb.Empty{})
+	topics, err := grpcTailClient.ListTopics(contextCRUD, &emptypb.Empty{})
 	if err != nil {
 		panic(err)
 	}
@@ -83,17 +91,17 @@ func main() {
 	time.Sleep(time.Second)
 
 	fmt.Println("\nSubscribing to topics.")
-	subNode, err := grpcClient.GetSubscriptionNode(contextCRUD, &pb.SubscriptionNodeRequest{UserId: user.Id, TopicId: []int64{topic1.Id, topic2.Id}})
+	subNode, err := grpcHeadClient.GetSubscriptionNode(contextCRUD, &pb.SubscriptionNodeRequest{UserId: user.Id, TopicId: []int64{topic1.Id, topic2.Id}})
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("Subscribed to topics with token: %v\n", subNode.SubscribeToken)
+	fmt.Printf("Subscribed to topics with token: %v from node %v\n", subNode.SubscribeToken, subNode.Node.NodeId)
 
 	go func() {
 		defer func() { done <- true }()
 
 		fmt.Println("\nStarting to listen for new messages...")
-		if stream, err := grpcClient.SubscribeTopic(contextCRUD, &pb.SubscribeTopicRequest{TopicId: []int64{topic1.Id, topic2.Id}, UserId: user.Id, FromMessageId: 0, SubscribeToken: subNode.SubscribeToken}); err != nil {
+		if stream, err := grpcHeadClient.SubscribeTopic(contextCRUD, &pb.SubscribeTopicRequest{TopicId: []int64{topic1.Id, topic2.Id}, UserId: user.Id, FromMessageId: 0, SubscribeToken: subNode.SubscribeToken}); err != nil {
 			panic(err)
 		} else {
 			for {
@@ -110,7 +118,7 @@ func main() {
 	time.Sleep(time.Second)
 
 	fmt.Println("\nPosting message1.")
-	message1, err := grpcClient.PostMessage(contextCRUD, &pb.PostMessageRequest{Text: "Prvo sporočilo v prvi temi", TopicId: topic1.Id, UserId: user.Id})
+	message1, err := grpcHeadClient.PostMessage(contextCRUD, &pb.PostMessageRequest{Text: "Prvo sporočilo v prvi temi", TopicId: topic1.Id, UserId: user.Id})
 	if err != nil {
 		panic(err)
 	}
@@ -119,7 +127,7 @@ func main() {
 	time.Sleep(time.Second)
 
 	fmt.Println("\nPosting message2.")
-	message2, err := grpcClient.PostMessage(contextCRUD, &pb.PostMessageRequest{Text: "Drugo sporočilo v prvi temi", TopicId: topic1.Id, UserId: user.Id})
+	message2, err := grpcHeadClient.PostMessage(contextCRUD, &pb.PostMessageRequest{Text: "Drugo sporočilo v prvi temi", TopicId: topic1.Id, UserId: user.Id})
 	if err != nil {
 		panic(err)
 	}
@@ -128,7 +136,7 @@ func main() {
 	time.Sleep(time.Second)
 
 	fmt.Println("\nPrinting messages.")
-	messages, err := grpcClient.GetMessages(contextCRUD, &pb.GetMessagesRequest{TopicId: topic1.Id, FromMessageId: 0, Limit: 0})
+	messages, err := grpcTailClient.GetMessages(contextCRUD, &pb.GetMessagesRequest{TopicId: topic1.Id, FromMessageId: 0, Limit: 0})
 	if err != nil {
 		panic(err)
 	}
@@ -140,7 +148,7 @@ func main() {
 	time.Sleep(time.Second)
 
 	fmt.Println("\nPosting message3.")
-	message3, err := grpcClient.PostMessage(contextCRUD, &pb.PostMessageRequest{Text: "Prvo sporočilo v drugi temi", TopicId: topic2.Id, UserId: user.Id})
+	message3, err := grpcHeadClient.PostMessage(contextCRUD, &pb.PostMessageRequest{Text: "Prvo sporočilo v drugi temi", TopicId: topic2.Id, UserId: user.Id})
 	if err != nil {
 		panic(err)
 	}
@@ -149,7 +157,7 @@ func main() {
 	time.Sleep(time.Second)
 
 	fmt.Println("\nUpdating message2.")
-	_, err = grpcClient.UpdateMessage(contextCRUD, &pb.UpdateMessageRequest{TopicId: topic1.Id, UserId: user.Id, MessageId: message2.Id, Text: "Posodobljeno drugo sporočilo v prvi temi"})
+	_, err = grpcHeadClient.UpdateMessage(contextCRUD, &pb.UpdateMessageRequest{TopicId: topic1.Id, UserId: user.Id, MessageId: message2.Id, Text: "Posodobljeno drugo sporočilo v prvi temi"})
 	if err != nil {
 		panic(err)
 	}
@@ -158,7 +166,7 @@ func main() {
 	time.Sleep(time.Second)
 
 	fmt.Println("\nPrinting messages from message ID 2.")
-	messages, err = grpcClient.GetMessages(contextCRUD, &pb.GetMessagesRequest{TopicId: topic1.Id, FromMessageId: 2, Limit: 0})
+	messages, err = grpcTailClient.GetMessages(contextCRUD, &pb.GetMessagesRequest{TopicId: topic1.Id, FromMessageId: 2, Limit: 0})
 	if err != nil {
 		panic(err)
 	}
@@ -170,7 +178,7 @@ func main() {
 	time.Sleep(time.Second)
 
 	fmt.Println("\nDeleting message1.")
-	_, err = grpcClient.DeleteMessage(contextCRUD, &pb.DeleteMessageRequest{TopicId: topic1.Id, UserId: user.Id, MessageId: message1.Id})
+	_, err = grpcHeadClient.DeleteMessage(contextCRUD, &pb.DeleteMessageRequest{TopicId: topic1.Id, UserId: user.Id, MessageId: message1.Id})
 	if err != nil {
 		panic(err)
 	}
@@ -179,7 +187,7 @@ func main() {
 	time.Sleep(time.Second)
 
 	fmt.Println("\nPrinting messages with limit 1.")
-	messages, err = grpcClient.GetMessages(contextCRUD, &pb.GetMessagesRequest{TopicId: topic1.Id, FromMessageId: 0, Limit: 1})
+	messages, err = grpcTailClient.GetMessages(contextCRUD, &pb.GetMessagesRequest{TopicId: topic1.Id, FromMessageId: 0, Limit: 1})
 	if err != nil {
 		panic(err)
 	}
@@ -191,7 +199,7 @@ func main() {
 	time.Sleep(time.Second)
 
 	fmt.Println("\nLiking message3.")
-	_, err = grpcClient.LikeMessage(contextCRUD, &pb.LikeMessageRequest{TopicId: topic2.Id, UserId: user.Id, MessageId: message3.Id})
+	_, err = grpcHeadClient.LikeMessage(contextCRUD, &pb.LikeMessageRequest{TopicId: topic2.Id, UserId: user.Id, MessageId: message3.Id})
 	if err != nil {
 		panic(err)
 	}
@@ -200,7 +208,7 @@ func main() {
 	time.Sleep(time.Second)
 
 	fmt.Println("\nPrinting messages.")
-	messagesTopic2, err := grpcClient.GetMessages(contextCRUD, &pb.GetMessagesRequest{TopicId: topic2.Id, FromMessageId: 0, Limit: 0})
+	messagesTopic2, err := grpcTailClient.GetMessages(contextCRUD, &pb.GetMessagesRequest{TopicId: topic2.Id, FromMessageId: 0, Limit: 0})
 	if err != nil {
 		panic(err)
 	}
@@ -212,17 +220,17 @@ func main() {
 	time.Sleep(time.Second)
 
 	fmt.Println("\nSubscribing to topics.")
-	subNode1, err := grpcClient.GetSubscriptionNode(contextCRUD, &pb.SubscriptionNodeRequest{UserId: user1.Id, TopicId: []int64{topic1.Id, topic2.Id}})
+	subNode1, err := grpcHeadClient.GetSubscriptionNode(contextCRUD, &pb.SubscriptionNodeRequest{UserId: user1.Id, TopicId: []int64{topic1.Id, topic2.Id}})
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("Subscribed to topics with token: %v\n", subNode1.SubscribeToken)
+	fmt.Printf("Subscribed to topics with token: %v from node %v\n", subNode1.SubscribeToken, subNode1.Node.NodeId)
 
 	go func() {
 		defer func() { done <- true }()
 
 		fmt.Println("\nStarting to listen for new messages...")
-		if stream, err := grpcClient.SubscribeTopic(contextCRUD, &pb.SubscribeTopicRequest{TopicId: []int64{topic1.Id, topic2.Id}, UserId: user1.Id, FromMessageId: 0, SubscribeToken: subNode1.SubscribeToken}); err != nil {
+		if stream, err := grpcHeadClient.SubscribeTopic(contextCRUD, &pb.SubscribeTopicRequest{TopicId: []int64{topic1.Id, topic2.Id}, UserId: user1.Id, FromMessageId: 0, SubscribeToken: subNode1.SubscribeToken}); err != nil {
 			panic(err)
 		} else {
 			for {

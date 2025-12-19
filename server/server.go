@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -11,7 +12,8 @@ import (
 
 	pb "razpravljalnica/pb" //import pb.go datoteke
 
-	"google.golang.org/grpc"                             //glavna knjižnica za grpc
+	"google.golang.org/grpc" //glavna knjižnica za grpc
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/emptypb"     //import zaradi google.protobuf.Empty, ki ga uporabimo v metodah, kazalec na "nic"
 	"google.golang.org/protobuf/types/known/timestamppb" //uporabimo zaradi create_at, event_at
 )
@@ -59,6 +61,13 @@ type messageBoardServer struct {
 	// identiteta tega vozlišča (za ControlPlane)
 	nodeID  string
 	address string
+
+	// chain replication
+	successor             *pb.NodeInfo          // naslednje vozlišče v verigi
+	predecessor           *pb.NodeInfo          // prejšnje vozlišče v verigi
+	chain                 []*pb.NodeInfo        // celotna veriga vozlišč
+	successorClient       pb.MessageBoardClient // gRPC klient za komunikacijo s successorjem
+	nodeSubscriptionCount map[string]int64      // število naročnin na vozlišče (za load balancing)
 
 	// naročnina
 	postEvents  map[int64]map[int64]*pb.MessageEvent
@@ -124,14 +133,19 @@ func (s *messageBoardServer) removeSubscription(id int64) {
 }
 
 // CreateUser ustvari novega uporabnika in mu dodeli ID.
+// Write operacije so dovoljene samo na head vozlišču.
 func (s *messageBoardServer) CreateUser(ctx context.Context, request *pb.CreateUserRequest) (*pb.User, error) {
+	// samo head lahko sprejema write operacije
+	if !s.isHead() {
+		return nil, fmt.Errorf("write operations only allowed at head node")
+	}
+
 	if request.GetName() == "" {
 		return nil, fmt.Errorf("name not valid")
 	}
 
 	// zaklenemo za pisanje, ker bomo spreminjali stanje
 	s.lock.Lock()
-	defer s.lock.Unlock()
 
 	//preverjanje unikatnosti imena
 	for _, user := range s.users {
@@ -152,19 +166,30 @@ func (s *messageBoardServer) CreateUser(ctx context.Context, request *pb.CreateU
 
 	// shranimo v bazo
 	s.users[id] = user
+	s.lock.Unlock()
+
+	// posredujemo naprej v verigo (unlock first to avoid deadlock)
+	if err := s.propagateCreateUser(ctx, user); err != nil {
+		return nil, err
+	}
 
 	// vrnemo uporabnika nazaj odjemalcu
 	return user, nil
 }
 
 // CreateTopic ustvari novo temo in ji dodeli ID.
+// Write operacije so dovoljene samo na head vozlišču.
 func (s *messageBoardServer) CreateTopic(ctx context.Context, request *pb.CreateTopicRequest) (*pb.Topic, error) {
+	// samo head lahko sprejema write operacije
+	if !s.isHead() {
+		return nil, fmt.Errorf("write operations only allowed at head node")
+	}
+
 	if request.GetName() == "" {
 		return nil, fmt.Errorf("topic name not valid")
 	}
 
 	s.lock.Lock()
-	defer s.lock.Unlock()
 
 	s.nextTopicID++
 	id := s.nextTopicID
@@ -189,11 +214,24 @@ func (s *messageBoardServer) CreateTopic(ctx context.Context, request *pb.Create
 		s.postEvents[id] = make(map[int64]*pb.MessageEvent)
 	}
 
+	s.lock.Unlock()
+
+	// posredujemo naprej v verigo
+	if err := s.propagateCreateTopic(ctx, topic); err != nil {
+		return nil, err
+	}
+
 	return topic, nil
 }
 
 // ListTopics vrne vse teme.
+// Read operacije servira samo tail vozlišče.
 func (s *messageBoardServer) ListTopics(ctx context.Context, _ *emptypb.Empty) (*pb.ListTopicsResponse, error) { //context.context nujen del rpc metode
+	// samo tail lahko streže read operacije
+	if !s.isTail() {
+		return nil, fmt.Errorf("read operations only allowed at tail node")
+	}
+
 	s.lock.RLock()         // samo beremo - RLock
 	defer s.lock.RUnlock() // sprostimo lock na koncu
 
@@ -210,22 +248,29 @@ func (s *messageBoardServer) ListTopics(ctx context.Context, _ *emptypb.Empty) (
 
 // PostMessage doda novo sporočilo v temo.
 // Uspe le, če user in topic obstajata.
+// Write operacije so dovoljene samo na head vozlišču.
 func (s *messageBoardServer) PostMessage(ctx context.Context, request *pb.PostMessageRequest) (*pb.Message, error) {
+
+	// samo head lahko sprejema write operacije
+	if !s.isHead() {
+		return nil, fmt.Errorf("write operations only allowed at head node")
+	}
 
 	if request.GetText() == "" {
 		return nil, fmt.Errorf("message text not valid")
 	}
 
 	s.lock.Lock()
-	defer s.lock.Unlock()
 
 	//preverimo, da user obstaja
 	if _, ok := s.users[request.GetUserId()]; !ok {
+		s.lock.Unlock()
 		return nil, fmt.Errorf("user %d does not exist", request.GetUserId())
 	}
 
 	//preverimo, da topic obstaja
 	if _, ok := s.topics[request.GetTopicId()]; !ok {
+		s.lock.Unlock()
 		return nil, fmt.Errorf("topic %d does not exist", request.GetTopicId())
 	}
 
@@ -263,13 +308,26 @@ func (s *messageBoardServer) PostMessage(ctx context.Context, request *pb.PostMe
 
 	s.broadcastEvent(event) //sprotni broadcast vsem naročnikom
 
+	s.lock.Unlock()
+
+	// posredujemo naprej v verigo
+	if err := s.propagateToSuccessor(ctx, pb.OpType_OP_POST, message); err != nil {
+		return nil, err
+	}
+
 	return message, nil
 }
 
 // GetMessages vrne sporočila znotraj določene teme, urejena po ID-ju naraščajoče.
 // from_message_id = 0 pomeni "od začetka"
 // limit določa maksimalno število sporočil (0 = brez omejitve).
+// Read operacije so dovoljene samo na tail vozlišču.
 func (s *messageBoardServer) GetMessages(ctx context.Context, request *pb.GetMessagesRequest) (*pb.GetMessagesResponse, error) {
+	// samo tail lahko streže read operacije
+	if !s.isTail() {
+		return nil, fmt.Errorf("read operations only allowed at tail node")
+	}
+
 	s.lock.RLock()
 	defer s.lock.RUnlock()
 
@@ -313,29 +371,38 @@ func (s *messageBoardServer) GetMessages(ctx context.Context, request *pb.GetMes
 
 // UpdateMessage posodobi obstoječe sporočilo.
 // Dovoli se samo uporabniku, ki je sporočilo napisal.
+// Write operacije so dovoljene samo na head vozlišču.
 func (s *messageBoardServer) UpdateMessage(ctx context.Context, request *pb.UpdateMessageRequest) (*pb.Message, error) {
+	// samo head lahko sprejema write operacije
+	if !s.isHead() {
+		return nil, fmt.Errorf("write operations only allowed at head node")
+	}
+
 	s.lock.Lock()
-	defer s.lock.Unlock()
 
 	//preverimo, če user obstaja
 	if _, ok := s.users[request.GetUserId()]; !ok {
+		s.lock.Unlock()
 		return nil, fmt.Errorf("user %d does not exist", request.GetUserId())
 	}
 
 	//preverimo, če tema obstaja
 	tMessages, ok := s.messages[request.GetTopicId()]
 	if !ok {
+		s.lock.Unlock()
 		return nil, fmt.Errorf("topic %d does not exist", request.GetTopicId())
 	}
 
 	//preverimo, če sporočilo obstaja
 	message, ok := tMessages[request.GetMessageId()]
 	if !ok {
+		s.lock.Unlock()
 		return nil, fmt.Errorf("message %d does not exist", request.GetMessageId())
 	}
 
 	//preverimo, da je to sporočilo od ustreznega uporabnika
 	if message.UserId != request.GetUserId() {
+		s.lock.Unlock()
 		return nil, fmt.Errorf("user %d is not the author of message %d", request.GetUserId(), request.GetMessageId())
 	}
 
@@ -345,34 +412,50 @@ func (s *messageBoardServer) UpdateMessage(ctx context.Context, request *pb.Upda
 	event := s.newMessageEvent(pb.OpType_OP_UPDATE, message)
 	s.broadcastEvent(event) //sprotni broadcast naročnikom
 
+	s.lock.Unlock()
+
+	// posredujemo naprej v verigo
+	if err := s.propagateToSuccessor(ctx, pb.OpType_OP_UPDATE, message); err != nil {
+		return nil, err
+	}
+
 	return message, nil
 }
 
 // DeleteMessage izbriše obstoječe sporočilo.
 // Dovoljeno samo avtorju sporočila.
+// Write operacije so dovoljene samo na head vozlišču.
 func (s *messageBoardServer) DeleteMessage(ctx context.Context, request *pb.DeleteMessageRequest) (*emptypb.Empty, error) {
+	// samo head lahko sprejema write operacije
+	if !s.isHead() {
+		return nil, fmt.Errorf("write operations only allowed at head node")
+	}
+
 	s.lock.Lock()
-	defer s.lock.Unlock()
 
 	//preverimo, če user obstaja
 	if _, ok := s.users[request.GetUserId()]; !ok {
+		s.lock.Unlock()
 		return nil, fmt.Errorf("user %d does not exist", request.GetUserId())
 	}
 
 	// preverimo, če user obstaja
 	tMessages, ok := s.messages[request.GetTopicId()]
 	if !ok {
+		s.lock.Unlock()
 		return nil, fmt.Errorf("topic %d does not exist", request.GetTopicId())
 	}
 
 	//preverimo, če sporočilo obstaja
 	message, ok := tMessages[request.GetMessageId()]
 	if !ok {
+		s.lock.Unlock()
 		return nil, fmt.Errorf("message %d does not exist", request.GetMessageId())
 	}
 
 	//preverimo, da je to sporočilo od ustreznega uporabnika
 	if message.UserId != request.GetUserId() {
+		s.lock.Unlock()
 		return nil, fmt.Errorf("user %d is not the author of message %d", request.GetUserId(), request.GetMessageId())
 	}
 
@@ -383,29 +466,44 @@ func (s *messageBoardServer) DeleteMessage(ctx context.Context, request *pb.Dele
 
 	s.broadcastEvent(event) //sprotni broadcast naročnikom
 
+	s.lock.Unlock()
+
+	// posredujemo naprej v verigo
+	if err := s.propagateToSuccessor(ctx, pb.OpType_OP_DELETE, message); err != nil {
+		return nil, err
+	}
+
 	return &emptypb.Empty{}, nil
 }
 
 // LikeMessage poveča število všečkov na sporočilu.
 // Sporočilo lahko like-a katerikoli obstoječi uporabnik
+// Write operacije so dovoljene samo na head vozlišču.
 func (s *messageBoardServer) LikeMessage(ctx context.Context, request *pb.LikeMessageRequest) (*pb.Message, error) {
+	// samo head lahko sprejema write operacije
+	if !s.isHead() {
+		return nil, fmt.Errorf("write operations only allowed at head node")
+	}
+
 	s.lock.Lock()
-	defer s.lock.Unlock()
 
 	// preverimo, da uporabnik obstaja, da lahko všečka
 	if _, ok := s.users[request.GetUserId()]; !ok {
+		s.lock.Unlock()
 		return nil, fmt.Errorf("user %d does not exist", request.GetUserId())
 	}
 
 	// preverimo, da tema obstaja
 	tMessages, ok := s.messages[request.GetTopicId()]
 	if !ok {
+		s.lock.Unlock()
 		return nil, fmt.Errorf("topic %d does not exist", request.GetTopicId())
 	}
 
 	// preverimo, da sporočilo obstaja
 	message, ok := tMessages[request.GetMessageId()]
 	if !ok {
+		s.lock.Unlock()
 		return nil, fmt.Errorf("message %d does not exist", request.GetMessageId())
 	}
 
@@ -415,26 +513,151 @@ func (s *messageBoardServer) LikeMessage(ctx context.Context, request *pb.LikeMe
 	event := s.newMessageEvent(pb.OpType_OP_LIKE, message)
 	s.broadcastEvent(event) //sprotni broadcast naročnikom
 
+	s.lock.Unlock()
+
+	// posredujemo naprej v verigo
+	if err := s.propagateToSuccessor(ctx, pb.OpType_OP_LIKE, message); err != nil {
+		return nil, err
+	}
+
 	return message, nil
 }
 
-// gre za nadzorno ravnino, ki spremlja katera vozlišča so head in tail, zaenkrat vse isti strežnik, ker je samo en
+// isHead preverja, ali je to vozlišče glava verige
+func (s *messageBoardServer) isHead() bool {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	return s.predecessor == nil
+}
+
+// isTail preverja, ali je to vozlišče rep verige
+func (s *messageBoardServer) isTail() bool {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	return s.successor == nil
+}
+
+// propagateToSuccessor posreduje operacijo naslednjemu vozlišču v verigi
+func (s *messageBoardServer) propagateToSuccessor(ctx context.Context, op pb.OpType, message *pb.Message) error {
+	s.lock.RLock()
+	successorClient := s.successorClient
+	s.lock.RUnlock()
+
+	if successorClient == nil {
+		// ni successorja, smo tail
+		return nil
+	}
+
+	// posredujemo operacijo naslednjemu vozlišču
+	switch op {
+	case pb.OpType_OP_POST:
+		req := &pb.PostMessageRequest{
+			UserId:    message.UserId,
+			TopicId:   message.TopicId,
+			Text:      message.Text,
+			MessageId: message.Id, // posreduj ID, ki ga je generiral head
+		}
+		_, err := successorClient.PropagatePost(ctx, req)
+		return err
+
+	case pb.OpType_OP_UPDATE:
+		req := &pb.UpdateMessageRequest{
+			UserId:    message.UserId,
+			TopicId:   message.TopicId,
+			MessageId: message.Id,
+			Text:      message.Text,
+		}
+		_, err := successorClient.PropagateUpdate(ctx, req)
+		return err
+
+	case pb.OpType_OP_DELETE:
+		req := &pb.DeleteMessageRequest{
+			UserId:    message.UserId,
+			TopicId:   message.TopicId,
+			MessageId: message.Id,
+		}
+		_, err := successorClient.PropagateDelete(ctx, req)
+		return err
+
+	case pb.OpType_OP_LIKE:
+		req := &pb.LikeMessageRequest{
+			UserId:    message.UserId,
+			TopicId:   message.TopicId,
+			MessageId: message.Id,
+		}
+		_, err := successorClient.PropagateLike(ctx, req)
+		return err
+	}
+
+	return nil
+}
+
+// propagateCreateUser posreduje CreateUser operacijo naslednjemu vozlišču
+func (s *messageBoardServer) propagateCreateUser(ctx context.Context, user *pb.User) error {
+	s.lock.RLock()
+	successorClient := s.successorClient
+	s.lock.RUnlock()
+
+	if successorClient == nil {
+		// ni successorja, smo tail
+		return nil
+	}
+
+	req := &pb.CreateUserRequest{
+		Name: user.Name,
+		Id:   user.Id, // posreduj ID, ki ga je generiral head
+	}
+	_, err := successorClient.PropagateCreateUser(ctx, req)
+	return err
+}
+
+// propagateCreateTopic posreduje CreateTopic operacijo naslednjemu vozlišču
+func (s *messageBoardServer) propagateCreateTopic(ctx context.Context, topic *pb.Topic) error {
+	s.lock.RLock()
+	successorClient := s.successorClient
+	s.lock.RUnlock()
+
+	if successorClient == nil {
+		// ni successorja, smo tail
+		return nil
+	}
+
+	req := &pb.CreateTopicRequest{
+		Name: topic.Name,
+		Id:   topic.Id, // posreduj ID, ki ga je generiral head
+	}
+	_, err := successorClient.PropagateCreateTopic(ctx, req)
+	return err
+}
+
+// gre za nadzorno ravnino, ki spremlja katera vozlišča so head in tail
 func (s *messageBoardServer) GetClusterState(ctx context.Context, _ *emptypb.Empty) (*pb.GetClusterStateResponse, error) {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
 
-	node := &pb.NodeInfo{
-		NodeId:  s.nodeID,
-		Address: s.address,
+	var head, tail *pb.NodeInfo
+
+	if len(s.chain) > 0 {
+		head = s.chain[0]
+		tail = s.chain[len(s.chain)-1]
+	} else {
+		// če ni verige, vrnemo samo ta node
+		node := &pb.NodeInfo{
+			NodeId:  s.nodeID,
+			Address: s.address,
+		}
+		head = node
+		tail = node
 	}
 
 	return &pb.GetClusterStateResponse{
-		Head: node,
-		Tail: node,
+		Head: head,
+		Tail: tail,
 	}, nil
 }
 
 // GetSubscriptionNode vrne node, na katerega naj se klient naroči in generira subscribe_token, ki ga bo kasneje preveril SubscribeTopic.
+// Izvaja load balancing tako, da izbere vozlišče z najmanj naročninami.
 func (s *messageBoardServer) GetSubscriptionNode(ctx context.Context, request *pb.SubscriptionNodeRequest) (*pb.SubscriptionNodeResponse, error) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
@@ -447,13 +670,35 @@ func (s *messageBoardServer) GetSubscriptionNode(ctx context.Context, request *p
 	// generiramo in shranimo token
 	token := s.newSubscribeToken(request.GetUserId(), request.GetTopicId())
 
-	// vrnemo ta strežnik kot node
-	return &pb.SubscriptionNodeResponse{
-		SubscribeToken: token,
-		Node: &pb.NodeInfo{
+	// izberi vozlišče z najmanj naročninami za load balancing
+	var selectedNode *pb.NodeInfo
+	var minCount int64 = -1
+
+	if len(s.chain) > 0 {
+		// iteriramo skozi vso verigo in poiščemo vozlišče z najmanj naročninami
+		for _, node := range s.chain {
+			count := s.nodeSubscriptionCount[node.GetNodeId()]
+			if minCount == -1 || count < minCount {
+				minCount = count
+				selectedNode = node
+			}
+		}
+		// povečamo števec za izbrano vozlišče
+		if selectedNode != nil {
+			s.nodeSubscriptionCount[selectedNode.GetNodeId()]++
+		}
+	} else {
+		// če ni verige, vrnemo samo ta node
+		selectedNode = &pb.NodeInfo{
 			NodeId:  s.nodeID,
 			Address: s.address,
-		},
+		}
+		s.nodeSubscriptionCount[s.nodeID]++
+	}
+
+	return &pb.SubscriptionNodeResponse{
+		SubscribeToken: token,
+		Node:           selectedNode,
 	}, nil
 }
 
@@ -558,42 +803,395 @@ func (s *messageBoardServer) SubscribeTopic(request *pb.SubscribeTopicRequest, s
 	}
 }
 
+// PropagatePost prejme POST operacijo od predecessor vozlišča in jo posreduje naprej
+func (s *messageBoardServer) PropagatePost(ctx context.Context, request *pb.PostMessageRequest) (*pb.Message, error) {
+	s.lock.Lock()
+
+	// preverimo, da user obstaja
+	if _, ok := s.users[request.GetUserId()]; !ok {
+		s.lock.Unlock()
+		return nil, fmt.Errorf("user %d does not exist", request.GetUserId())
+	}
+
+	// preverimo, da topic obstaja
+	if _, ok := s.topics[request.GetTopicId()]; !ok {
+		s.lock.Unlock()
+		return nil, fmt.Errorf("topic %d does not exist", request.GetTopicId())
+	}
+
+	// topic mora imeti mapo za sporočila
+	if _, ok := s.messages[request.GetTopicId()]; !ok {
+		s.messages[request.GetTopicId()] = make(map[int64]*pb.Message)
+	}
+
+	topicID := request.GetTopicId()
+
+	// uporabimo ID, ki ga je določil head (poslan v requestu), namesto da ustvarjamo novega
+	id := request.GetMessageId()
+	if id == 0 {
+		// generiraj ID, če ni podan (naj se ne bi zgodilo)
+		s.nextMessageID[topicID]++
+		id = s.nextMessageID[topicID]
+	} else {
+		// posodobi števec ID-jev, da ustreza prejetemu ID-ju (od heada)
+		if id > s.nextMessageID[topicID] {
+			s.nextMessageID[topicID] = id
+		}
+	}
+
+	message := &pb.Message{
+		Id:        id,
+		TopicId:   request.GetTopicId(),
+		UserId:    request.GetUserId(),
+		Text:      request.GetText(),
+		CreatedAt: timestamppb.Now(),
+		Likes:     0,
+	}
+
+	// shranimo v bazo
+	s.messages[topicID][id] = message
+
+	event := s.newMessageEvent(pb.OpType_OP_POST, message)
+
+	// shranimo originalni POST event za backlog
+	if _, ok := s.postEvents[topicID]; !ok {
+		s.postEvents[topicID] = make(map[int64]*pb.MessageEvent)
+	}
+	s.postEvents[topicID][id] = event
+
+	s.broadcastEvent(event)
+
+	s.lock.Unlock()
+
+	// posredujemo naprej v verigo
+	if err := s.propagateToSuccessor(ctx, pb.OpType_OP_POST, message); err != nil {
+		return nil, err
+	}
+
+	return message, nil
+}
+
+// PropagateUpdate prejme UPDATE operacijo od predecessor vozlišča
+func (s *messageBoardServer) PropagateUpdate(ctx context.Context, request *pb.UpdateMessageRequest) (*pb.Message, error) {
+	s.lock.Lock()
+
+	// preverimo, če user obstaja
+	if _, ok := s.users[request.GetUserId()]; !ok {
+		s.lock.Unlock()
+		return nil, fmt.Errorf("user %d does not exist", request.GetUserId())
+	}
+
+	// preverimo, če tema obstaja
+	tMessages, ok := s.messages[request.GetTopicId()]
+	if !ok {
+		s.lock.Unlock()
+		return nil, fmt.Errorf("topic %d does not exist", request.GetTopicId())
+	}
+
+	// preverimo, če sporočilo obstaja
+	message, ok := tMessages[request.GetMessageId()]
+	if !ok {
+		s.lock.Unlock()
+		return nil, fmt.Errorf("message %d does not exist", request.GetMessageId())
+	}
+
+	// preverimo, da je to sporočilo od ustreznega uporabnika
+	if message.UserId != request.GetUserId() {
+		s.lock.Unlock()
+		return nil, fmt.Errorf("user %d is not the author of message %d", request.GetUserId(), request.GetMessageId())
+	}
+
+	// posodobimo besedilo
+	message.Text = request.GetText()
+
+	event := s.newMessageEvent(pb.OpType_OP_UPDATE, message)
+	s.broadcastEvent(event)
+
+	s.lock.Unlock()
+
+	// posredujemo naprej v verigo
+	if err := s.propagateToSuccessor(ctx, pb.OpType_OP_UPDATE, message); err != nil {
+		return nil, err
+	}
+
+	return message, nil
+}
+
+// PropagateDelete prejme DELETE operacijo od predecessor vozlišča
+func (s *messageBoardServer) PropagateDelete(ctx context.Context, request *pb.DeleteMessageRequest) (*emptypb.Empty, error) {
+	s.lock.Lock()
+
+	// preverimo, če user obstaja
+	if _, ok := s.users[request.GetUserId()]; !ok {
+		s.lock.Unlock()
+		return nil, fmt.Errorf("user %d does not exist", request.GetUserId())
+	}
+
+	// preverimo, če user obstaja
+	tMessages, ok := s.messages[request.GetTopicId()]
+	if !ok {
+		s.lock.Unlock()
+		return nil, fmt.Errorf("topic %d does not exist", request.GetTopicId())
+	}
+
+	// preverimo, če sporočilo obstaja
+	message, ok := tMessages[request.GetMessageId()]
+	if !ok {
+		s.lock.Unlock()
+		return nil, fmt.Errorf("message %d does not exist", request.GetMessageId())
+	}
+
+	// preverimo, da je to sporočilo od ustreznega uporabnika
+	if message.UserId != request.GetUserId() {
+		s.lock.Unlock()
+		return nil, fmt.Errorf("user %d is not the author of message %d", request.GetUserId(), request.GetMessageId())
+	}
+
+	event := s.newMessageEvent(pb.OpType_OP_DELETE, message)
+
+	// izbrišemo sporočilo
+	delete(tMessages, request.GetMessageId())
+
+	s.broadcastEvent(event)
+
+	s.lock.Unlock()
+
+	// posredujemo naprej v verigo
+	if err := s.propagateToSuccessor(ctx, pb.OpType_OP_DELETE, message); err != nil {
+		return nil, err
+	}
+
+	return &emptypb.Empty{}, nil
+}
+
+// PropagateLike prejme LIKE operacijo od predecessor vozlišča
+func (s *messageBoardServer) PropagateLike(ctx context.Context, request *pb.LikeMessageRequest) (*pb.Message, error) {
+	s.lock.Lock()
+
+	// preverimo, da uporabnik obstaja, da lahko všečka
+	if _, ok := s.users[request.GetUserId()]; !ok {
+		s.lock.Unlock()
+		return nil, fmt.Errorf("user %d does not exist", request.GetUserId())
+	}
+
+	// preverimo, da tema obstaja
+	tMessages, ok := s.messages[request.GetTopicId()]
+	if !ok {
+		s.lock.Unlock()
+		return nil, fmt.Errorf("topic %d does not exist", request.GetTopicId())
+	}
+
+	// preverimo, da sporočilo obstaja
+	message, ok := tMessages[request.GetMessageId()]
+	if !ok {
+		s.lock.Unlock()
+		return nil, fmt.Errorf("message %d does not exist", request.GetMessageId())
+	}
+
+	// povečamo število všečkov
+	message.Likes++
+
+	event := s.newMessageEvent(pb.OpType_OP_LIKE, message)
+	s.broadcastEvent(event)
+
+	s.lock.Unlock()
+
+	// posredujemo naprej v verigo
+	if err := s.propagateToSuccessor(ctx, pb.OpType_OP_LIKE, message); err != nil {
+		return nil, err
+	}
+
+	return message, nil
+}
+
+// PropagateCreateUser prejme CreateUser operacijo od predecessor vozlišča
+func (s *messageBoardServer) PropagateCreateUser(ctx context.Context, request *pb.CreateUserRequest) (*pb.User, error) {
+	s.lock.Lock()
+
+	// preverjanje unikatnosti imena
+	for _, user := range s.users {
+		if user.Name == request.GetName() {
+			s.lock.Unlock()
+			return nil, fmt.Errorf("username taken")
+		}
+	}
+
+	// uporabimo ID, ki ga je določil head (poslan v requestu), namesto da ustvarjamo novega
+	id := request.GetId()
+	if id == 0 {
+		// generiraj ID, če ni podan (naj se ne bi zgodilo)
+		s.nextUserID++
+		id = s.nextUserID
+	} else {
+		// posodobi števec ID-jev, da ustreza prejetemu ID-ju (od heada)
+		if id > s.nextUserID {
+			s.nextUserID = id
+		}
+	}
+
+	// sestavimo novega userja
+	user := &pb.User{
+		Id:   id,
+		Name: request.GetName(),
+	}
+
+	// shranimo v bazo
+	s.users[id] = user
+
+	s.lock.Unlock()
+
+	// posredujemo naprej v verigo
+	if err := s.propagateCreateUser(ctx, user); err != nil {
+		return nil, err
+	}
+
+	return user, nil
+}
+
+// PropagateCreateTopic prejme CreateTopic operacijo od predecessor vozlišča
+func (s *messageBoardServer) PropagateCreateTopic(ctx context.Context, request *pb.CreateTopicRequest) (*pb.Topic, error) {
+	s.lock.Lock()
+
+	// uporabimo ID, ki ga je določil head (poslan v requestu), namesto da ustvarjamo novega
+	id := request.GetId()
+	if id == 0 {
+		// generiraj ID, če ni podan (naj se ne bi zgodilo)
+		s.nextTopicID++
+		id = s.nextTopicID
+	} else {
+		// posodobi števec ID-jev, da ustreza prejetemu ID-ju (od heada)
+		if id > s.nextTopicID {
+			s.nextTopicID = id
+		}
+	}
+
+	topic := &pb.Topic{
+		Id:   id,
+		Name: request.GetName(),
+	}
+
+	s.topics[id] = topic
+
+	// za vsak nov topic pripravimo mapo za sporočila
+	if _, ok := s.messages[id]; !ok {
+		s.messages[id] = make(map[int64]*pb.Message)
+	}
+
+	if _, ok := s.nextMessageID[id]; !ok {
+		s.nextMessageID[id] = 0
+	}
+
+	if _, ok := s.postEvents[id]; !ok {
+		s.postEvents[id] = make(map[int64]*pb.MessageEvent)
+	}
+
+	s.lock.Unlock()
+
+	// posredujemo naprej v verigo
+	if err := s.propagateCreateTopic(ctx, topic); err != nil {
+		return nil, err
+	}
+
+	return topic, nil
+}
+
+// ConfigureChain konfigurira verigo replikacije
+func (s *messageBoardServer) ConfigureChain(ctx context.Context, request *pb.ConfigureChainRequest) (*emptypb.Empty, error) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	nodes := request.GetNodes()
+	s.chain = nodes
+
+	// inicializiramo števce naročnin za vsa vozlišča v verigi
+	for _, node := range nodes {
+		if _, ok := s.nodeSubscriptionCount[node.GetNodeId()]; !ok {
+			s.nodeSubscriptionCount[node.GetNodeId()] = 0
+		}
+	}
+
+	// poiščemo svoj položaj v verigi
+	var myIndex int = -1
+	for i, node := range nodes {
+		if node.GetNodeId() == s.nodeID {
+			myIndex = i
+			break
+		}
+	}
+
+	if myIndex == -1 {
+		return nil, fmt.Errorf("this node (%s) is not in the chain", s.nodeID)
+	}
+
+	// nastavimo predecessor
+	if myIndex > 0 {
+		s.predecessor = nodes[myIndex-1]
+	} else {
+		s.predecessor = nil
+	}
+
+	// nastavimo successor
+	if myIndex < len(nodes)-1 {
+		s.successor = nodes[myIndex+1]
+
+		// ustvarimo gRPC povezavo do successorja
+		conn, err := grpc.NewClient(s.successor.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			return nil, fmt.Errorf("failed to connect to successor: %v", err)
+		}
+		s.successorClient = pb.NewMessageBoardClient(conn)
+	} else {
+		s.successor = nil
+		s.successorClient = nil
+	}
+
+	log.Printf("Chain configured: position %d/%d, predecessor=%v, successor=%v",
+		myIndex+1, len(nodes), s.predecessor != nil, s.successor != nil)
+
+	return &emptypb.Empty{}, nil
+}
+
 /*
 Konstruktor
 */
-func newMessageBoardServer() *messageBoardServer {
+func newMessageBoardServer(nodeID, address string) *messageBoardServer {
 	return &messageBoardServer{
-		users:         make(map[int64]*pb.User),
-		topics:        make(map[int64]*pb.Topic),
-		messages:      make(map[int64]map[int64]*pb.Message),
-		nextMessageID: make(map[int64]int64),
-		postEvents:    make(map[int64]map[int64]*pb.MessageEvent),
-		tokens:        make(map[string]*SubscriptionTokenInfo),
-		subscribers:   make(map[int64]*subscription),
-		nodeID:        "node-1",
-		address:       ":50051",
+		users:                 make(map[int64]*pb.User),
+		topics:                make(map[int64]*pb.Topic),
+		messages:              make(map[int64]map[int64]*pb.Message),
+		nextMessageID:         make(map[int64]int64),
+		postEvents:            make(map[int64]map[int64]*pb.MessageEvent),
+		tokens:                make(map[string]*SubscriptionTokenInfo),
+		subscribers:           make(map[int64]*subscription),
+		nodeID:                nodeID,
+		address:               address,
+		chain:                 make([]*pb.NodeInfo, 0),
+		nodeSubscriptionCount: make(map[string]int64),
 	}
 }
 
 // glavna funkcija - gRPC strežnik
 func main() {
-
-	address := ":50051" //standardni gRPC port
+	nodeID := flag.String("n", "node-1", "node ID")
+	address := flag.Int("a", 50051, "listen address")
+	flag.Parse()
 
 	grpcStreznik := grpc.NewServer() //ustvari nov gRPC strežnik
 
-	streznik := newMessageBoardServer() // ustvarimo strežnik, glavni strežnik
+	url := fmt.Sprintf("localhost:%d", *address)
+
+	streznik := newMessageBoardServer(*nodeID, url) // ustvarimo strežnik
 
 	pb.RegisterMessageBoardServer(grpcStreznik, streznik) // registriramo oba servisa, ta je glavni za večino funkcij odjemalca
 	pb.RegisterControlPlaneServer(grpcStreznik, streznik) //nadzorna ravnina
 
 	// odpremo TCP port
-	listen, err := net.Listen("tcp", address)
+	listen, err := net.Listen("tcp", url)
 	if err != nil {
 		panic(err)
 	}
 
-	log.Printf("MessageBoard server listening on %s", address)
+	log.Printf("MessageBoard server %s listening on %s", *nodeID, url)
 
 	if err := grpcStreznik.Serve(listen); err != nil {
 		panic(err)
