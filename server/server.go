@@ -105,22 +105,40 @@ func (s *messageBoardServer) allocateSeqNumber() int64 {
 	return s.nextSeq
 }
 
+// prepareAck creates an acknowledgment channel for a sequence number
+func (s *messageBoardServer) prepareAck(seqNum int64) {
+	s.ackLock.Lock()
+	defer s.ackLock.Unlock()
+	if s.isTail() {
+		return
+	}
+	s.ackChannels[seqNum] = make(chan bool, 1)
+}
+
 // waitForAck waits for acknowledgment from tail with timeout
 func (s *messageBoardServer) waitForAck(seqNum int64) bool {
+	s.ackLock.Lock()
+
 	// if we are tail, no need to wait
 	if s.isTail() {
+		s.ackLock.Unlock()
 		return true
 	}
 
-	// create acknowledgment channel
-	s.ackLock.Lock()
-	ackChan := make(chan bool, 1)
-	s.ackChannels[seqNum] = ackChan
+	// get acknowledgment channel
+	ackChan, ok := s.ackChannels[seqNum]
 	s.ackLock.Unlock()
 
-	// wait for ack with timeout
+	if !ok {
+		return false
+	}
+
 	select {
 	case <-ackChan:
+		// Clean up the channel after receiving
+		s.ackLock.Lock()
+		delete(s.ackChannels, seqNum)
+		s.ackLock.Unlock()
 		return true
 	case <-time.After(5 * time.Second):
 		// cleanup channel on timeout
@@ -141,7 +159,7 @@ func (s *messageBoardServer) sendAck(seqNum int64) {
 		case ackChan <- true:
 		default:
 		}
-		delete(s.ackChannels, seqNum)
+		// Don't delete here - let waitForAck clean up after receiving
 	}
 }
 
@@ -164,7 +182,6 @@ func (s *messageBoardServer) validateSequenceNumber(seqNum int64) error {
 
 // newMessageEvent uporabimo, da za naročnino zabeležimo vse evente, ki se zgodijo in jih broadcastamo vsem naročnikom
 func (s *messageBoardServer) newMessageEvent(op pb.OpType, message *pb.Message) *pb.MessageEvent {
-	// s.nextSeq++
 	return &pb.MessageEvent{
 		SequenceNumber: s.nextSeq,
 		Op:             op,
@@ -245,15 +262,13 @@ func (s *messageBoardServer) CreateUser(ctx context.Context, request *pb.CreateU
 	s.users[id] = user
 	s.lock.Unlock()
 
-	// posredujemo naprej v verigo asinhrono
-	go func() {
-		propagateCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+	// prepare ack channel before propagation
+	s.prepareAck(seqNum)
 
-		if err := s.propagateCreateUser(propagateCtx, user); err != nil {
-			log.Printf("Failed to propagate user creation: %v", err)
-		}
-	}()
+	// posredujemo naprej v verigo
+	if err := s.propagateCreateUser(ctx, user); err != nil {
+		return nil, err
+	}
 
 	// wait for acknowledgment from tail
 	if s.waitForAck(seqNum) {
@@ -307,15 +322,13 @@ func (s *messageBoardServer) CreateTopic(ctx context.Context, request *pb.Create
 
 	s.lock.Unlock()
 
-	// posredujemo naprej v verigo asinhrono
-	go func() {
-		propagateCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+	// prepare ack channel before propagation
+	s.prepareAck(seqNum)
 
-		if err := s.propagateCreateTopic(propagateCtx, topic); err != nil {
-			log.Printf("Failed to propagate topic creation: %v", err)
-		}
-	}()
+	// posredujemo naprej v verigo
+	if err := s.propagateCreateTopic(ctx, topic); err != nil {
+		return nil, err
+	}
 
 	// wait for acknowledgment from tail
 	if s.waitForAck(seqNum) {
@@ -330,13 +343,13 @@ func (s *messageBoardServer) CreateTopic(ctx context.Context, request *pb.Create
 // ListTopics vrne vse teme.
 // Read operacije servira samo tail vozlišče.
 func (s *messageBoardServer) ListTopics(ctx context.Context, _ *emptypb.Empty) (*pb.ListTopicsResponse, error) { //context.context nujen del rpc metode
+	s.lock.RLock()         // samo beremo - RLock
+	defer s.lock.RUnlock() // sprostimo lock na koncu
+
 	// samo tail lahko streže read operacije
 	if !s.isTail() {
 		return nil, fmt.Errorf("read operations only allowed at tail node")
 	}
-
-	s.lock.RLock()         // samo beremo - RLock
-	defer s.lock.RUnlock() // sprostimo lock na koncu
 
 	response := &pb.ListTopicsResponse{
 		Topics: make([]*pb.Topic, 0, len(s.topics)),
@@ -416,15 +429,13 @@ func (s *messageBoardServer) PostMessage(ctx context.Context, request *pb.PostMe
 
 	s.lock.Unlock()
 
-	// posredujemo naprej v verigo asinhrono
-	go func() {
-		propagateCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+	// prepare ack channel before propagation
+	s.prepareAck(seqNum)
 
-		if err := s.propagateToSuccessor(propagateCtx, pb.OpType_OP_POST, message); err != nil {
-			log.Printf("Failed to propagate post message: %v", err)
-		}
-	}()
+	// posredujemo naprej v verigo
+	if err := s.propagateToSuccessor(ctx, pb.OpType_OP_POST, message); err != nil {
+		return nil, err
+	}
 
 	// wait for acknowledgment from tail
 	if s.waitForAck(seqNum) {
@@ -441,13 +452,13 @@ func (s *messageBoardServer) PostMessage(ctx context.Context, request *pb.PostMe
 // limit določa maksimalno število sporočil (0 = brez omejitve).
 // Read operacije so dovoljene samo na tail vozlišču.
 func (s *messageBoardServer) GetMessages(ctx context.Context, request *pb.GetMessagesRequest) (*pb.GetMessagesResponse, error) {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+
 	// samo tail lahko streže read operacije
 	if !s.isTail() {
 		return nil, fmt.Errorf("read operations only allowed at tail node")
 	}
-
-	s.lock.RLock()
-	defer s.lock.RUnlock()
 
 	// preverimo, če tema obstaja
 	tMessages, ok := s.messages[request.GetTopicId()]
@@ -535,15 +546,13 @@ func (s *messageBoardServer) UpdateMessage(ctx context.Context, request *pb.Upda
 
 	s.lock.Unlock()
 
-	// posredujemo naprej v verigo asinhrono
-	go func() {
-		propagateCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+	// prepare ack channel before propagation
+	s.prepareAck(seqNum)
 
-		if err := s.propagateToSuccessor(propagateCtx, pb.OpType_OP_UPDATE, message); err != nil {
-			log.Printf("Failed to propagate update message: %v", err)
-		}
-	}()
+	// posredujemo naprej v verigo
+	if err := s.propagateToSuccessor(ctx, pb.OpType_OP_UPDATE, message); err != nil {
+		return nil, err
+	}
 
 	// wait for acknowledgment from tail
 	if s.waitForAck(seqNum) {
@@ -605,15 +614,13 @@ func (s *messageBoardServer) DeleteMessage(ctx context.Context, request *pb.Dele
 
 	s.lock.Unlock()
 
-	// posredujemo naprej v verigo asinhrono
-	go func() {
-		propagateCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+	// prepare ack channel before propagation
+	s.prepareAck(seqNum)
 
-		if err := s.propagateToSuccessor(propagateCtx, pb.OpType_OP_DELETE, message); err != nil {
-			log.Printf("Failed to propagate delete message: %v", err)
-		}
-	}()
+	// posredujemo naprej v verigo
+	if err := s.propagateToSuccessor(ctx, pb.OpType_OP_DELETE, message); err != nil {
+		return nil, err
+	}
 
 	// wait for acknowledgment from tail
 	if !s.waitForAck(seqNum) {
@@ -665,15 +672,13 @@ func (s *messageBoardServer) LikeMessage(ctx context.Context, request *pb.LikeMe
 
 	s.lock.Unlock()
 
-	// posredujemo naprej v verigo asinhrono
-	go func() {
-		propagateCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+	// prepare ack channel before propagation
+	s.prepareAck(seqNum)
 
-		if err := s.propagateToSuccessor(propagateCtx, pb.OpType_OP_LIKE, message); err != nil {
-			log.Printf("Failed to propagate like message: %v", err)
-		}
-	}()
+	// posredujemo naprej v verigo
+	if err := s.propagateToSuccessor(ctx, pb.OpType_OP_LIKE, message); err != nil {
+		return nil, err
+	}
 
 	// wait for acknowledgment from tail
 	if s.waitForAck(seqNum) {
@@ -1494,24 +1499,22 @@ func (s *messageBoardServer) PropagateToken(ctx context.Context, request *pb.Tok
 
 // AckPost handles acknowledgment for POST operations
 func (s *messageBoardServer) AckPost(ctx context.Context, request *pb.AckRequest) (*emptypb.Empty, error) {
-	seqNum := request.GetSequenceNumber()
-	s.sendAck(seqNum)
+	if s.isHead() {
+		s.sendAck(request.GetSequenceNumber())
+		return &emptypb.Empty{}, nil
+	}
 
-	// if we're not head, forward ack to predecessor
 	s.lock.RLock()
 	pred := s.predecessor
 	s.lock.RUnlock()
 
 	if pred != nil {
 		conn, err := grpc.NewClient(pred.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			log.Printf("Failed to connect to predecessor for ack: %v", err)
-			return &emptypb.Empty{}, nil
+		if err == nil {
+			defer conn.Close()
+			client := pb.NewMessageBoardClient(conn)
+			_, _ = client.AckPost(ctx, request)
 		}
-		defer conn.Close()
-
-		client := pb.NewMessageBoardClient(conn)
-		_, _ = client.AckPost(ctx, request)
 	}
 
 	return &emptypb.Empty{}, nil
@@ -1519,8 +1522,10 @@ func (s *messageBoardServer) AckPost(ctx context.Context, request *pb.AckRequest
 
 // AckUpdate handles acknowledgment for UPDATE operations
 func (s *messageBoardServer) AckUpdate(ctx context.Context, request *pb.AckRequest) (*emptypb.Empty, error) {
-	seqNum := request.GetSequenceNumber()
-	s.sendAck(seqNum)
+	if s.isHead() {
+		s.sendAck(request.GetSequenceNumber())
+		return &emptypb.Empty{}, nil
+	}
 
 	s.lock.RLock()
 	pred := s.predecessor
@@ -1528,14 +1533,11 @@ func (s *messageBoardServer) AckUpdate(ctx context.Context, request *pb.AckReque
 
 	if pred != nil {
 		conn, err := grpc.NewClient(pred.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			log.Printf("Failed to connect to predecessor for ack: %v", err)
-			return &emptypb.Empty{}, nil
+		if err == nil {
+			defer conn.Close()
+			client := pb.NewMessageBoardClient(conn)
+			_, _ = client.AckUpdate(ctx, request)
 		}
-		defer conn.Close()
-
-		client := pb.NewMessageBoardClient(conn)
-		_, _ = client.AckUpdate(ctx, request)
 	}
 
 	return &emptypb.Empty{}, nil
@@ -1543,8 +1545,10 @@ func (s *messageBoardServer) AckUpdate(ctx context.Context, request *pb.AckReque
 
 // AckDelete handles acknowledgment for DELETE operations
 func (s *messageBoardServer) AckDelete(ctx context.Context, request *pb.AckRequest) (*emptypb.Empty, error) {
-	seqNum := request.GetSequenceNumber()
-	s.sendAck(seqNum)
+	if s.isHead() {
+		s.sendAck(request.GetSequenceNumber())
+		return &emptypb.Empty{}, nil
+	}
 
 	s.lock.RLock()
 	pred := s.predecessor
@@ -1552,14 +1556,11 @@ func (s *messageBoardServer) AckDelete(ctx context.Context, request *pb.AckReque
 
 	if pred != nil {
 		conn, err := grpc.NewClient(pred.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			log.Printf("Failed to connect to predecessor for ack: %v", err)
-			return &emptypb.Empty{}, nil
+		if err == nil {
+			defer conn.Close()
+			client := pb.NewMessageBoardClient(conn)
+			_, _ = client.AckDelete(ctx, request)
 		}
-		defer conn.Close()
-
-		client := pb.NewMessageBoardClient(conn)
-		_, _ = client.AckDelete(ctx, request)
 	}
 
 	return &emptypb.Empty{}, nil
@@ -1567,8 +1568,10 @@ func (s *messageBoardServer) AckDelete(ctx context.Context, request *pb.AckReque
 
 // AckLike handles acknowledgment for LIKE operations
 func (s *messageBoardServer) AckLike(ctx context.Context, request *pb.AckRequest) (*emptypb.Empty, error) {
-	seqNum := request.GetSequenceNumber()
-	s.sendAck(seqNum)
+	if s.isHead() {
+		s.sendAck(request.GetSequenceNumber())
+		return &emptypb.Empty{}, nil
+	}
 
 	s.lock.RLock()
 	pred := s.predecessor
@@ -1576,14 +1579,11 @@ func (s *messageBoardServer) AckLike(ctx context.Context, request *pb.AckRequest
 
 	if pred != nil {
 		conn, err := grpc.NewClient(pred.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			log.Printf("Failed to connect to predecessor for ack: %v", err)
-			return &emptypb.Empty{}, nil
+		if err == nil {
+			defer conn.Close()
+			client := pb.NewMessageBoardClient(conn)
+			_, _ = client.AckLike(ctx, request)
 		}
-		defer conn.Close()
-
-		client := pb.NewMessageBoardClient(conn)
-		_, _ = client.AckLike(ctx, request)
 	}
 
 	return &emptypb.Empty{}, nil
@@ -1591,26 +1591,21 @@ func (s *messageBoardServer) AckLike(ctx context.Context, request *pb.AckRequest
 
 // AckCreateUser handles acknowledgment for CREATE USER operations
 func (s *messageBoardServer) AckCreateUser(ctx context.Context, request *pb.AckRequest) (*emptypb.Empty, error) {
-	seqNum := request.GetSequenceNumber()
-	s.sendAck(seqNum)
+	if s.isHead() {
+		s.sendAck(request.GetSequenceNumber())
+		return &emptypb.Empty{}, nil
+	}
 
 	s.lock.RLock()
 	pred := s.predecessor
-	isHead := s.isHead()
 	s.lock.RUnlock()
 
-	if !isHead && pred != nil {
+	if pred != nil {
 		conn, err := grpc.NewClient(pred.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			log.Printf("Failed to connect to predecessor for ack: %v", err)
-			return &emptypb.Empty{}, err
-		}
-		defer conn.Close()
-
-		client := pb.NewMessageBoardClient(conn)
-		_, err = client.AckCreateUser(ctx, request)
-		if err != nil {
-			return &emptypb.Empty{}, err
+		if err == nil {
+			defer conn.Close()
+			client := pb.NewMessageBoardClient(conn)
+			_, _ = client.AckCreateUser(ctx, request)
 		}
 	}
 
@@ -1619,8 +1614,10 @@ func (s *messageBoardServer) AckCreateUser(ctx context.Context, request *pb.AckR
 
 // AckCreateTopic handles acknowledgment for CREATE TOPIC operations
 func (s *messageBoardServer) AckCreateTopic(ctx context.Context, request *pb.AckRequest) (*emptypb.Empty, error) {
-	seqNum := request.GetSequenceNumber()
-	s.sendAck(seqNum)
+	if s.isHead() {
+		s.sendAck(request.GetSequenceNumber())
+		return &emptypb.Empty{}, nil
+	}
 
 	s.lock.RLock()
 	pred := s.predecessor
@@ -1628,14 +1625,11 @@ func (s *messageBoardServer) AckCreateTopic(ctx context.Context, request *pb.Ack
 
 	if pred != nil {
 		conn, err := grpc.NewClient(pred.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			log.Printf("Failed to connect to predecessor for ack: %v", err)
-			return &emptypb.Empty{}, nil
+		if err == nil {
+			defer conn.Close()
+			client := pb.NewMessageBoardClient(conn)
+			_, _ = client.AckCreateTopic(ctx, request)
 		}
-		defer conn.Close()
-
-		client := pb.NewMessageBoardClient(conn)
-		_, _ = client.AckCreateTopic(ctx, request)
 	}
 
 	return &emptypb.Empty{}, nil

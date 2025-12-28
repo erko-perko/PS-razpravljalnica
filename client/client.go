@@ -234,7 +234,7 @@ func main() {
 	go func() {
 		defer func() { done <- true }()
 
-		subConn, err := grpc.NewClient(subNode.Node.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		subConn, err := grpc.NewClient(subNode1.Node.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			panic(err)
 		}
