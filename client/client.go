@@ -100,8 +100,13 @@ func main() {
 	go func() {
 		defer func() { done <- true }()
 
+		subConn, err := grpc.NewClient(subNode.Node.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			panic(err)
+		}
+		grpcSubClient := pb.NewMessageBoardClient(subConn)
 		fmt.Println("\nStarting to listen for new messages...")
-		if stream, err := grpcHeadClient.SubscribeTopic(contextCRUD, &pb.SubscribeTopicRequest{TopicId: []int64{topic1.Id, topic2.Id}, UserId: user.Id, FromMessageId: 0, SubscribeToken: subNode.SubscribeToken}); err != nil {
+		if stream, err := grpcSubClient.SubscribeTopic(contextCRUD, &pb.SubscribeTopicRequest{TopicId: []int64{topic1.Id, topic2.Id}, UserId: user.Id, FromMessageId: 0, SubscribeToken: subNode.SubscribeToken}); err != nil {
 			panic(err)
 		} else {
 			for {
@@ -229,8 +234,13 @@ func main() {
 	go func() {
 		defer func() { done <- true }()
 
+		subConn, err := grpc.NewClient(subNode.Node.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			panic(err)
+		}
+		grpcSubClient := pb.NewMessageBoardClient(subConn)
 		fmt.Println("\nStarting to listen for new messages...")
-		if stream, err := grpcHeadClient.SubscribeTopic(contextCRUD, &pb.SubscribeTopicRequest{TopicId: []int64{topic1.Id, topic2.Id}, UserId: user1.Id, FromMessageId: 0, SubscribeToken: subNode1.SubscribeToken}); err != nil {
+		if stream, err := grpcSubClient.SubscribeTopic(contextCRUD, &pb.SubscribeTopicRequest{TopicId: []int64{topic1.Id, topic2.Id}, UserId: user1.Id, FromMessageId: 0, SubscribeToken: subNode1.SubscribeToken}); err != nil {
 			panic(err)
 		} else {
 			for {
