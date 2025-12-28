@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net"
 	"testing"
@@ -195,14 +196,14 @@ func TestReadOnlyAtTail(t *testing.T) {
 
 // Test: skladnost ID-jev po verigi
 func TestIDConsistency(t *testing.T) {
-	head := startTestServer("node-1", ":50068")
-	middle := startTestServer("node-2", ":50069")
-	tail := startTestServer("node-3", ":50070")
+	head := startTestServer("node-1", "localhost:50068")
+	middle := startTestServer("node-2", "localhost:50069")
+	tail := startTestServer("node-3", "localhost:50070")
 
 	nodes := []*pb.NodeInfo{
-		{NodeId: "node-1", Address: ":50068"},
-		{NodeId: "node-2", Address: ":50069"},
-		{NodeId: "node-3", Address: ":50070"},
+		{NodeId: "node-1", Address: "localhost:50068"},
+		{NodeId: "node-2", Address: "localhost:50069"},
+		{NodeId: "node-3", Address: "localhost:50070"},
 	}
 
 	ctx := context.Background()
@@ -210,11 +211,19 @@ func TestIDConsistency(t *testing.T) {
 	middle.ConfigureChain(ctx, &pb.ConfigureChainRequest{Nodes: nodes})
 	tail.ConfigureChain(ctx, &pb.ConfigureChainRequest{Nodes: nodes})
 
+	time.Sleep(100 * time.Millisecond)
+
 	// Create user at head
 	user, err := head.CreateUser(ctx, &pb.CreateUserRequest{Name: "Charlie"})
 	if err != nil {
 		t.Fatalf("Failed to create user: %v", err)
 	}
+
+	if !user.Committed {
+		t.Error("User should be committed after acknowledgment from tail")
+	}
+
+	fmt.Println("Created user with ID:", user.Id)
 
 	// kratek zamik za razširjanje
 	time.Sleep(100 * time.Millisecond)
@@ -234,6 +243,312 @@ func TestIDConsistency(t *testing.T) {
 		t.Error("User not propagated to tail node")
 	} else if tailUser.Name != "Charlie" {
 		t.Errorf("Expected user name 'Charlie' in tail, got '%s'", tailUser.Name)
+	}
+}
+
+// Test: sequence numbers are assigned and increment correctly
+func TestSequenceNumbers(t *testing.T) {
+	head := startTestServer("node-1", "localhost:50071")
+	tail := startTestServer("node-2", "localhost:50072")
+
+	nodes := []*pb.NodeInfo{
+		{NodeId: "node-1", Address: "localhost:50071"},
+		{NodeId: "node-2", Address: "localhost:50072"},
+	}
+
+	ctx := context.Background()
+	head.ConfigureChain(ctx, &pb.ConfigureChainRequest{Nodes: nodes})
+	tail.ConfigureChain(ctx, &pb.ConfigureChainRequest{Nodes: nodes})
+
+	// Create user and topic
+	user, _ := head.CreateUser(ctx, &pb.CreateUserRequest{Name: "SeqTest"})
+	topic, _ := head.CreateTopic(ctx, &pb.CreateTopicRequest{Name: "SeqTopic"})
+
+	if user.SequenceNumber <= 0 {
+		t.Error("User should have positive sequence number")
+	}
+	if topic.SequenceNumber <= 0 {
+		t.Error("Topic should have positive sequence number")
+	}
+	if topic.SequenceNumber <= user.SequenceNumber {
+		t.Error("Topic sequence number should be greater than user sequence number")
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Post multiple messages and verify sequence numbers increase
+	lastSeq := topic.SequenceNumber
+	for i := 0; i < 3; i++ {
+		msg, err := head.PostMessage(ctx, &pb.PostMessageRequest{
+			TopicId: topic.Id,
+			UserId:  user.Id,
+			Text:    "Seq test",
+		})
+		if err != nil {
+			t.Fatalf("Failed to post message: %v", err)
+		}
+		if msg.SequenceNumber != lastSeq+1 {
+			t.Errorf("Sequence numbers should increase by 1: got %d after %d", msg.SequenceNumber, lastSeq)
+		}
+		lastSeq = msg.SequenceNumber
+	}
+}
+
+// Test: committed flag is set after acknowledgment from tail
+func TestCommittedFlag(t *testing.T) {
+	head := startTestServer("node-1", "localhost:50073")
+	tail := startTestServer("node-2", "localhost:50074")
+
+	nodes := []*pb.NodeInfo{
+		{NodeId: "node-1", Address: "localhost:50073"},
+		{NodeId: "node-2", Address: "localhost:50074"},
+	}
+
+	ctx := context.Background()
+	head.ConfigureChain(ctx, &pb.ConfigureChainRequest{Nodes: nodes})
+	tail.ConfigureChain(ctx, &pb.ConfigureChainRequest{Nodes: nodes})
+
+	user, _ := head.CreateUser(ctx, &pb.CreateUserRequest{Name: "CommitTest"})
+
+	// After acknowledgment, committed flag should be true
+	if !user.Committed {
+		t.Error("User should be committed after acknowledgment from tail")
+	}
+
+	topic, _ := head.CreateTopic(ctx, &pb.CreateTopicRequest{Name: "CommitTopic"})
+	if !topic.Committed {
+		t.Error("Topic should be committed after acknowledgment from tail")
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	msg, _ := head.PostMessage(ctx, &pb.PostMessageRequest{
+		TopicId: topic.Id,
+		UserId:  user.Id,
+		Text:    "Commit test",
+	})
+	if !msg.Committed {
+		t.Error("Message should be committed after acknowledgment from tail")
+	}
+}
+
+// Test: sequence number validation rejects out-of-order operations
+func TestSequenceValidation(t *testing.T) {
+	head := startTestServer("node-1", "localhost:50075")
+	middle := startTestServer("node-2", "localhost:50076")
+
+	nodes := []*pb.NodeInfo{
+		{NodeId: "node-1", Address: "localhost:50075"},
+		{NodeId: "node-2", Address: "localhost:50076"},
+	}
+
+	ctx := context.Background()
+	head.ConfigureChain(ctx, &pb.ConfigureChainRequest{Nodes: nodes})
+	middle.ConfigureChain(ctx, &pb.ConfigureChainRequest{Nodes: nodes})
+
+	user, _ := head.CreateUser(ctx, &pb.CreateUserRequest{Name: "ValidTest"})
+	topic, _ := head.CreateTopic(ctx, &pb.CreateTopicRequest{Name: "ValidTopic"})
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Manually try to propagate a message with a sequence number that skips values
+	// This simulates an out-of-order operation
+	_, err := middle.PropagatePost(ctx, &pb.PostMessageRequest{
+		TopicId:        topic.Id,
+		UserId:         user.Id,
+		Text:           "Out of order",
+		MessageId:      1,
+		SequenceNumber: middle.lastSeqNumber + 10, // Skip many sequence numbers
+	})
+
+	if err == nil {
+		t.Error("Should reject operation with out-of-order sequence number")
+	}
+}
+
+// Test: head and tail detection using explicit addresses
+func TestHeadTailDetectionWithAddresses(t *testing.T) {
+	head := startTestServer("node-1", "localhost:50077")
+	middle := startTestServer("node-2", "localhost:50078")
+	tail := startTestServer("node-3", "localhost:50079")
+
+	nodes := []*pb.NodeInfo{
+		{NodeId: "node-1", Address: "localhost:50077"},
+		{NodeId: "node-2", Address: "localhost:50078"},
+		{NodeId: "node-3", Address: "localhost:50079"},
+	}
+
+	ctx := context.Background()
+	head.ConfigureChain(ctx, &pb.ConfigureChainRequest{Nodes: nodes})
+	middle.ConfigureChain(ctx, &pb.ConfigureChainRequest{Nodes: nodes})
+	tail.ConfigureChain(ctx, &pb.ConfigureChainRequest{Nodes: nodes})
+
+	// Verify head detection
+	if !head.isHead() {
+		t.Error("node-1 should be detected as head")
+	}
+	if head.isTail() {
+		t.Error("node-1 should not be detected as tail")
+	}
+
+	// Verify middle detection
+	if middle.isHead() {
+		t.Error("node-2 should not be detected as head")
+	}
+	if middle.isTail() {
+		t.Error("node-2 should not be detected as tail")
+	}
+
+	// Verify tail detection
+	if tail.isHead() {
+		t.Error("node-3 should not be detected as head")
+	}
+	if !tail.isTail() {
+		t.Error("node-3 should be detected as tail")
+	}
+
+	// Simulate middle node failure by setting its successor to nil
+	// Head and tail should still be correctly identified
+	middle.lock.Lock()
+	middle.successor = nil
+	middle.lock.Unlock()
+
+	// Head and tail detection should still work correctly
+	if !head.isHead() {
+		t.Error("node-1 should still be head after middle node successor is nil")
+	}
+	if !tail.isTail() {
+		t.Error("node-3 should still be tail after middle node successor is nil")
+	}
+	if middle.isTail() {
+		t.Error("node-2 should not be detected as tail even with nil successor")
+	}
+}
+
+// Test: acknowledgment timeout behavior
+func TestAcknowledgmentTimeout(t *testing.T) {
+	head := startTestServer("node-1", "localhost:50080")
+	middle := startTestServer("node-2", "localhost:50081")
+
+	nodes := []*pb.NodeInfo{
+		{NodeId: "node-1", Address: "localhost:50080"},
+		{NodeId: "node-2", Address: "localhost:50081"},
+	}
+
+	ctx := context.Background()
+	head.ConfigureChain(ctx, &pb.ConfigureChainRequest{Nodes: nodes})
+	middle.ConfigureChain(ctx, &pb.ConfigureChainRequest{Nodes: nodes})
+
+	// Disconnect successor to simulate network failure
+	head.lock.Lock()
+	head.successorClient = nil
+	head.lock.Unlock()
+
+	user, err := head.CreateUser(ctx, &pb.CreateUserRequest{Name: "TimeoutTest"})
+
+	// Should timeout and return user with committed=false
+	if err != nil {
+		t.Fatalf("Should not error on timeout: %v", err)
+	}
+	if user.Committed {
+		t.Error("User should not be committed when acknowledgment times out")
+	}
+}
+
+// Test: acknowledgment propagates backward through chain
+func TestAcknowledgmentPropagation(t *testing.T) {
+	head := startTestServer("node-1", "localhost:50082")
+	middle := startTestServer("node-2", "localhost:50083")
+	tail := startTestServer("node-3", "localhost:50084")
+
+	nodes := []*pb.NodeInfo{
+		{NodeId: "node-1", Address: "localhost:50082"},
+		{NodeId: "node-2", Address: "localhost:50083"},
+		{NodeId: "node-3", Address: "localhost:50084"},
+	}
+
+	ctx := context.Background()
+	head.ConfigureChain(ctx, &pb.ConfigureChainRequest{Nodes: nodes})
+	middle.ConfigureChain(ctx, &pb.ConfigureChainRequest{Nodes: nodes})
+	tail.ConfigureChain(ctx, &pb.ConfigureChainRequest{Nodes: nodes})
+
+	user, _ := head.CreateUser(ctx, &pb.CreateUserRequest{Name: "AckPropTest"})
+	topic, _ := head.CreateTopic(ctx, &pb.CreateTopicRequest{Name: "AckPropTopic"})
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Post message and verify it gets committed
+	msg, err := head.PostMessage(ctx, &pb.PostMessageRequest{
+		TopicId: topic.Id,
+		UserId:  user.Id,
+		Text:    "Ack propagation test",
+	})
+
+	if err != nil {
+		t.Fatalf("Failed to post message: %v", err)
+	}
+
+	if !msg.Committed {
+		t.Error("Message should be committed after acknowledgment propagates from tail")
+	}
+
+	// Verify message exists on all nodes
+	time.Sleep(100 * time.Millisecond)
+
+	head.lock.RLock()
+	headMsg := head.messages[topic.Id][msg.Id]
+	head.lock.RUnlock()
+
+	middle.lock.RLock()
+	middleMsg := middle.messages[topic.Id][msg.Id]
+	middle.lock.RUnlock()
+
+	tail.lock.RLock()
+	tailMsg := tail.messages[topic.Id][msg.Id]
+	tail.lock.RUnlock()
+
+	if headMsg == nil || middleMsg == nil || tailMsg == nil {
+		t.Error("Message should exist on all nodes")
+	}
+}
+
+// Test: single node chain works correctly as both head and tail
+func TestSingleNodeChain(t *testing.T) {
+	node := startTestServer("node-1", "localhost:50085")
+
+	nodes := []*pb.NodeInfo{
+		{NodeId: "node-1", Address: "localhost:50085"},
+	}
+
+	ctx := context.Background()
+	node.ConfigureChain(ctx, &pb.ConfigureChainRequest{Nodes: nodes})
+
+	// Should be both head and tail
+	if !node.isHead() {
+		t.Error("Single node should be head")
+	}
+	if !node.isTail() {
+		t.Error("Single node should be tail")
+	}
+
+	// Should be able to perform both write and read operations
+	user, err := node.CreateUser(ctx, &pb.CreateUserRequest{Name: "Solo"})
+	if err != nil {
+		t.Errorf("Should be able to create user on single node: %v", err)
+	}
+
+	// Should not wait for acknowledgment (immediate commit)
+	if !user.Committed {
+		t.Error("Single node operations should be immediately committed")
+	}
+
+	// Should be able to read
+	topics, err := node.ListTopics(ctx, &emptypb.Empty{})
+	if err != nil {
+		t.Errorf("Should be able to list topics on single node: %v", err)
+	}
+	if topics == nil {
+		t.Error("Expected non-nil topics response")
 	}
 }
 
