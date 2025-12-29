@@ -2,10 +2,11 @@ syntax = "proto3";
 
 package razpravljalnica;
 
-option go_package = "/razpravljalnica";
+option go_package = "razpravljalnica/pb;pb";
 
 import "google/protobuf/empty.proto";
 import "google/protobuf/timestamp.proto";
+
 ////////////////////////////////////////////////////////////////////////////////
 // Basic data types
 ////////////////////////////////////////////////////////////////////////////////
@@ -14,14 +15,14 @@ message User {
   int64 id = 1;
   string name = 2;
   int64 sequence_number = 3; // sequence number for tracking propagation
-  bool committed = 4; // true if operation reached tail
+  bool committed = 4; // true if operation reached tail and acked back
 }
 
 message Topic {
   int64 id = 1;
   string name = 2;
   int64 sequence_number = 3; // sequence number for tracking propagation
-  bool committed = 4; // true if operation reached tail
+  bool committed = 4; // true if operation reached tail and acked back
 }
 
 message Message {
@@ -32,20 +33,16 @@ message Message {
   google.protobuf.Timestamp created_at = 5;
   int32 likes = 6;
   int64 sequence_number = 7; // sequence number for tracking propagation
-  bool committed = 8; // true if operation reached tail
-}
-
-message Like {
-  int64 topic_id = 1;
-  int64 message_id = 2;
-  int64 user_id = 3; // user who liked the message
+  bool committed = 8; // true if operation reached tail and acked back
 }
 
 enum OpType {
-  OP_POST   = 0; // add a message to a topic
-  OP_LIKE   = 1; // like a message
-  OP_DELETE = 2; // delete a message
-  OP_UPDATE = 3; // update a message
+  OP_POST = 0;
+  OP_LIKE = 1;
+  OP_DELETE = 2;
+  OP_UPDATE = 3;
+  OP_CREATE_USER = 4;
+  OP_CREATE_TOPIC = 5;
 }
 
 message NodeInfo {
@@ -54,103 +51,97 @@ message NodeInfo {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// Chain replication internal log/sync
+////////////////////////////////////////////////////////////////////////////////
+
+message LogEntry {
+  int64 sequence_number = 1;
+  string request_id = 2;
+  OpType op = 3;
+
+  // exactly one should be used based on op
+  User user = 4;
+  Topic topic = 5;
+  Message message = 6;
+}
+
+message GetLastAppliedRequest {}
+message GetLastAppliedResponse { int64 last_applied_seq = 1; }
+
+message SyncFromRequest { int64 from_seq_exclusive = 1; }
+message SyncFromResponse { repeated LogEntry entries = 1; }
+
+////////////////////////////////////////////////////////////////////////////////
 // Data plane
 ////////////////////////////////////////////////////////////////////////////////
 
-service  MessageBoard{
+service MessageBoard {
   // Writes (only to head)
-
-  // Creates a new user and assigns it an id
   rpc CreateUser(CreateUserRequest) returns (User);
-
-  // Creates a new topic to which users can post messages
   rpc CreateTopic(CreateTopicRequest) returns (Topic);
-
-  // Post a message to a topic; Succed only if the User and the Topic exist in the data base.
   rpc PostMessage(PostMessageRequest) returns (Message);
-
-  // Update an existing message. Allowed only for the user who posted the message.
   rpc UpdateMessage(UpdateMessageRequest) returns (Message);
-
-  // Delete an existing message. Allowed only for the user who posted the message.
   rpc DeleteMessage(DeleteMessageRequest) returns (google.protobuf.Empty);
-
-  // Like an existing message. Return the message with the new number of likes.
   rpc LikeMessage(LikeMessageRequest) returns (Message);
 
-  // Request a node to which a subscription can be opened.
+  // Subscription routing (only to head)
   rpc GetSubscriptionNode(SubscriptionNodeRequest) returns (SubscriptionNodeResponse);
 
-  // Reads go to the tail node
-
-  // Returns all the topics
+  // Reads (only to tail)
   rpc ListTopics(google.protobuf.Empty) returns (ListTopicsResponse);
-
-  // Returns messages in a topic
   rpc GetMessages(GetMessagesRequest) returns (GetMessagesResponse);
 
-  // Subscribe to topics; goes to the node returned by head
+  // Subscribe (to node returned by head)
   rpc SubscribeTopic(SubscribeTopicRequest) returns (stream MessageEvent);
 
-  // Chain replication propagation methods (internal use between nodes)
-  rpc PropagatePost(PostMessageRequest) returns (Message);
-  rpc PropagateUpdate(UpdateMessageRequest) returns (Message);
-  rpc PropagateDelete(DeleteMessageRequest) returns (google.protobuf.Empty);
-  rpc PropagateLike(LikeMessageRequest) returns (Message);
-  rpc PropagateCreateUser(CreateUserRequest) returns (User);
-  rpc PropagateCreateTopic(CreateTopicRequest) returns (Topic);
-  rpc PropagateToken(TokenPropagationRequest) returns (google.protobuf.Empty);
+  // Internal chain propagation (between nodes)
+  rpc PropagateEntry(LogEntry) returns (google.protobuf.Empty);
+  rpc Ack(AckRequest) returns (google.protobuf.Empty);
 
-  // Acknowledgment methods for commit confirmation (tail to head)
-  rpc AckPost(AckRequest) returns (google.protobuf.Empty);
-  rpc AckUpdate(AckRequest) returns (google.protobuf.Empty);
-  rpc AckDelete(AckRequest) returns (google.protobuf.Empty);
-  rpc AckLike(AckRequest) returns (google.protobuf.Empty);
-  rpc AckCreateUser(AckRequest) returns (google.protobuf.Empty);
-  rpc AckCreateTopic(AckRequest) returns (google.protobuf.Empty);
+  // Internal sync helpers (between nodes)
+  rpc GetLastApplied(GetLastAppliedRequest) returns (GetLastAppliedResponse);
+  rpc SyncFrom(SyncFromRequest) returns (SyncFromResponse);
 
+  rpc ConfigureChain(ConfigureChainRequest) returns (google.protobuf.Empty);
 }
 
 message CreateUserRequest {
   string name = 1;
-  int64 id = 2; // Optional: for internal chain replication (0 = generate new ID)
-  int64 sequence_number = 3; // Sequence number for tracking
+  string request_id = 2; // idempotency key (client-generated)
 }
 
 message CreateTopicRequest {
   string name = 1;
-  int64 id = 2; // Optional: for internal chain replication (0 = generate new ID)
-  int64 sequence_number = 3; // Sequence number for tracking
+  string request_id = 2; // idempotency key (client-generated)
 }
 
 message PostMessageRequest {
   int64 topic_id = 1;
   int64 user_id = 2;
   string text = 3;
-  int64 message_id = 4; // Optional: for internal chain replication (0 = generate new ID)
-  int64 sequence_number = 5; // Sequence number for tracking
+  string request_id = 4; // idempotency key (client-generated)
 }
 
 message DeleteMessageRequest {
   int64 topic_id = 1;
   int64 user_id = 2;
   int64 message_id = 3;
-  int64 sequence_number = 4; // Sequence number for tracking
+  string request_id = 4; // idempotency key (client-generated)
 }
 
 message UpdateMessageRequest {
   int64 topic_id = 1;
   int64 user_id = 2;
   int64 message_id = 3;
-  string text = 4; // new text
-  int64 sequence_number = 5; // Sequence number for tracking
+  string text = 4;
+  string request_id = 5; // idempotency key (client-generated)
 }
 
 message LikeMessageRequest {
   int64 topic_id = 1;
   int64 message_id = 2;
-  int64 user_id = 3; // user who posted the like
-  int64 sequence_number = 4; // Sequence number for tracking
+  int64 user_id = 3;
+  string request_id = 4; // idempotency key (client-generated)
 }
 
 message ListTopicsResponse {
@@ -159,9 +150,10 @@ message ListTopicsResponse {
 
 message GetMessagesRequest {
   int64 topic_id = 1;
-  int64 from_message_id = 2; // starting id of the message (0 from beggining)
-  int32 limit = 3; // max number of messages
+  int64 from_message_id = 2;
+  int32 limit = 3;
 }
+
 message GetMessagesResponse {
   repeated Message messages = 1;
 }
@@ -169,8 +161,8 @@ message GetMessagesResponse {
 message SubscribeTopicRequest {
   repeated int64 topic_id = 1;
   int64 user_id = 2;
-  int64 from_message_id = 3; // starting id of the message
-  string subscribe_token = 4; // token generated by the head used to authorize the subscription
+  int64 from_message_id = 3;
+  string subscribe_token = 4;
 }
 
 message SubscriptionNodeRequest {
@@ -179,45 +171,71 @@ message SubscriptionNodeRequest {
 }
 
 message SubscriptionNodeResponse {
-  string subscribe_token = 1; // subscription token to be presented to the returned node
+  string subscribe_token = 1;
   NodeInfo node = 2;
 }
 
 message MessageEvent {
-  int64 sequence_number = 1; // monotonically increasing event number
-  OpType op = 2; // type of event
+  int64 sequence_number = 1;
+  OpType op = 2;
   Message message = 3;
-  google.protobuf.Timestamp event_at = 4; // timestamp of the event
-}
-
-message TokenPropagationRequest {
-  string token = 1; // the subscription token
-  int64 user_id = 2;
-  repeated int64 topic_id = 3;
+  google.protobuf.Timestamp event_at = 4;
 }
 
 message AckRequest {
-  int64 sequence_number = 1; // sequence number of the operation being acknowledged
-  OpType op_type = 2; // type of operation
-  int64 entity_id = 3; // ID of the entity (user_id, topic_id, or message_id)
-  int64 topic_id = 4; // topic_id (for message operations)
+  int64 sequence_number = 1;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 // Control plane
 ////////////////////////////////////////////////////////////////////////////////
 
-// Return the the head and the tail node address
 service ControlPlane {
   rpc GetClusterState(google.protobuf.Empty) returns (GetClusterStateResponse);
   rpc ConfigureChain(ConfigureChainRequest) returns (google.protobuf.Empty);
+
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc Join(JoinRequest) returns (JoinResponse);
+  rpc Leave(LeaveRequest) returns (LeaveResponse);
 }
 
 message GetClusterStateResponse {
   NodeInfo head = 1;
   NodeInfo tail = 2;
+  repeated NodeInfo chain = 3;
 }
 
 message ConfigureChainRequest {
-  repeated NodeInfo nodes = 1; // ordered list of nodes in the chain (head to tail)
+  repeated NodeInfo nodes = 1; // ordered head -> tail
+}
+
+message HeartbeatRequest {
+  string node_id = 1;
+  string address = 2;
+  int64 last_applied_seq = 3;
+}
+
+message HeartbeatResponse {
+  bool ok = 1;
+}
+
+message JoinRequest {
+  string node_id = 1;
+  string address = 2;
+}
+
+message JoinResponse {
+  NodeInfo head = 1;
+  NodeInfo tail = 2;
+  repeated NodeInfo chain = 3;
+}
+
+message LeaveRequest {
+  string node_id = 1;
+}
+
+message LeaveResponse {
+  NodeInfo head = 1;
+  NodeInfo tail = 2;
+  repeated NodeInfo chain = 3;
 }
