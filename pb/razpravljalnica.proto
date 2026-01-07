@@ -197,6 +197,9 @@ service ControlPlane {
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc Join(JoinRequest) returns (JoinResponse);
   rpc Leave(LeaveRequest) returns (LeaveResponse);
+
+  rpc GetLeastLoadedNode(google.protobuf.Empty) returns (NodeInfo);
+
 }
 
 message GetClusterStateResponse {
@@ -213,6 +216,7 @@ message HeartbeatRequest {
   string node_id = 1;
   string address = 2;
   int64 last_applied_seq = 3;
+  int64 sub_count = 4;
 }
 
 message HeartbeatResponse {

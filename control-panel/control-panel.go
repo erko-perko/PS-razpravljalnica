@@ -34,6 +34,7 @@ type nodeStatus struct {
 	lastHeartbeat time.Time
 	lastApplied   int64
 	alive         bool
+	subCount      int64
 }
 
 type controlPlaneServer struct {
@@ -76,9 +77,9 @@ func (c *controlPlaneServer) ConfigureChain(ctx context.Context, req *pb.Configu
 		if _, ok := c.nodes[n.GetNodeId()]; !ok {
 			c.nodes[n.GetNodeId()] = &nodeStatus{
 				info:          &pb.NodeInfo{NodeId: n.GetNodeId(), Address: n.GetAddress()},
-				lastHeartbeat: time.Now(),
+				lastHeartbeat: time.Time{},
 				lastApplied:   0,
-				alive:         true,
+				alive:         false,
 			}
 		}
 	}
@@ -88,10 +89,36 @@ func (c *controlPlaneServer) ConfigureChain(ctx context.Context, req *pb.Configu
 	return &emptypb.Empty{}, nil
 }
 
-func (c *controlPlaneServer) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
+func (c *controlPlaneServer) GetLeastLoadedNode(ctx context.Context, _ *emptypb.Empty) (*pb.NodeInfo, error) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
+	var best *pb.NodeInfo
+	var bestCount int64 = -1
+
+	// izbiraj samo po chain vrstnem redu in samo alive node-e
+	for _, n := range c.chain {
+		st, ok := c.nodes[n.GetNodeId()]
+		if !ok || !st.alive {
+			continue
+		}
+		if best == nil || st.subCount < bestCount {
+			best = st.info
+			bestCount = st.subCount
+		}
+	}
+
+	if best == nil {
+		return &pb.NodeInfo{NodeId: "none", Address: ""}, nil
+	}
+	// vrni kopijo, da ne deliš pointerja
+	return &pb.NodeInfo{NodeId: best.GetNodeId(), Address: best.GetAddress()}, nil
+}
+
+func (c *controlPlaneServer) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
+	var changed bool
+
+	c.lock.Lock()
 	st, ok := c.nodes[req.GetNodeId()]
 	if !ok {
 		// auto-join on first heartbeat if not joined
@@ -101,27 +128,48 @@ func (c *controlPlaneServer) Heartbeat(ctx context.Context, req *pb.HeartbeatReq
 			lastHeartbeat: time.Now(),
 			lastApplied:   req.GetLastAppliedSeq(),
 			alive:         true,
+			subCount:      0,
 		}
+		st.subCount = req.GetSubCount()
 		c.nodes[req.GetNodeId()] = st
-		// join at tail
-		c.chain = append(c.chain, info)
-		go c.pushChainToAll()
-		return &pb.HeartbeatResponse{Ok: true}, nil
+
+		// join at tail, but avoid duplicates
+		changed = c.appendToChainIfMissing(info)
+	} else {
+		// normal heartbeat update
+		st.info.Address = req.GetAddress()
+		st.lastHeartbeat = time.Now()
+		st.lastApplied = req.GetLastAppliedSeq()
+		st.subCount = req.GetSubCount()
+		if !st.alive {
+			st.alive = true
+
+			// node was previously removed from chain by failure monitor -> re-add at tail if missing
+			if c.appendToChainIfMissing(st.info) {
+				changed = true
+			} else {
+				// even if already present, topology might have changed recently;
+				// not strictly required, but safer to re-push when a node revives
+				changed = true
+			}
+		} else {
+			st.alive = true
+		}
 	}
+	c.lock.Unlock()
 
-	st.info.Address = req.GetAddress()
-	st.lastHeartbeat = time.Now()
-	st.lastApplied = req.GetLastAppliedSeq()
-	st.alive = true
-
+	if changed {
+		go c.pushChainToAll()
+	}
 	return &pb.HeartbeatResponse{Ok: true}, nil
 }
 
 func (c *controlPlaneServer) Join(ctx context.Context, req *pb.JoinRequest) (*pb.JoinResponse, error) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
+	var changed bool
 
-	if _, ok := c.nodes[req.GetNodeId()]; !ok {
+	c.lock.Lock()
+	st, ok := c.nodes[req.GetNodeId()]
+	if !ok {
 		info := &pb.NodeInfo{NodeId: req.GetNodeId(), Address: req.GetAddress()}
 		c.nodes[req.GetNodeId()] = &nodeStatus{
 			info:          info,
@@ -129,13 +177,26 @@ func (c *controlPlaneServer) Join(ctx context.Context, req *pb.JoinRequest) (*pb
 			lastApplied:   0,
 			alive:         true,
 		}
-		// join at tail
-		c.chain = append(c.chain, info)
-		go c.pushChainToAll()
+		changed = c.appendToChainIfMissing(info)
+	} else {
+		// already known (maybe via heartbeat auto-join) -> just update
+		st.info.Address = req.GetAddress()
+		st.lastHeartbeat = time.Now()
+		if !st.alive {
+			st.alive = true
+		}
+		// ensure it's in chain (avoid duplicates)
+		changed = c.appendToChainIfMissing(st.info)
 	}
 
 	head, tail := c.getHeadTailLocked()
-	return &pb.JoinResponse{Head: head, Tail: tail, Chain: append([]*pb.NodeInfo(nil), c.chain...)}, nil
+	resp := &pb.JoinResponse{Head: head, Tail: tail, Chain: append([]*pb.NodeInfo(nil), c.chain...)}
+	c.lock.Unlock()
+
+	if changed {
+		go c.pushChainToAll()
+	}
+	return resp, nil
 }
 
 func (c *controlPlaneServer) Leave(ctx context.Context, req *pb.LeaveRequest) (*pb.LeaveResponse, error) {
@@ -167,6 +228,23 @@ func filterChain(chain []*pb.NodeInfo, nodeID string) []*pb.NodeInfo {
 		}
 	}
 	return out
+}
+
+func (c *controlPlaneServer) inChain(nodeID string) bool {
+	for _, n := range c.chain {
+		if n.GetNodeId() == nodeID {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *controlPlaneServer) appendToChainIfMissing(info *pb.NodeInfo) bool {
+	if c.inChain(info.GetNodeId()) {
+		return false
+	}
+	c.chain = append(c.chain, info)
+	return true
 }
 
 func (c *controlPlaneServer) monitorFailuresLoop() {
@@ -208,9 +286,9 @@ func (c *controlPlaneServer) monitorFailuresLoop() {
 func (c *controlPlaneServer) pushChainToAll() {
 	c.lock.Lock()
 	nodes := append([]*pb.NodeInfo(nil), c.chain...)
-	aliveTargets := make([]*pb.NodeInfo, 0, len(c.nodes))
-	for _, st := range c.nodes {
-		if st.alive {
+	aliveTargets := make([]*pb.NodeInfo, 0, len(nodes))
+	for _, n := range nodes {
+		if st, ok := c.nodes[n.GetNodeId()]; ok && st.alive {
 			aliveTargets = append(aliveTargets, st.info)
 		}
 	}
@@ -218,13 +296,16 @@ func (c *controlPlaneServer) pushChainToAll() {
 
 	req := &pb.ConfigureChainRequest{Nodes: nodes}
 	for _, n := range aliveTargets {
-		conn, err := grpc.Dial(n.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(n.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			continue
 		}
 		client := pb.NewMessageBoardClient(conn)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_, _ = client.ConfigureChain(ctx, req)
+		_, err = client.ConfigureChain(ctx, req)
+		if err != nil {
+			log.Printf("Napaka v konfiguraciji strežnika %s: %v", n.GetAddress(), err)
+		}
 		cancel()
 		_ = conn.Close()
 	}

@@ -670,11 +670,12 @@ var MessageBoard_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	ControlPlane_GetClusterState_FullMethodName = "/razpravljalnica.ControlPlane/GetClusterState"
-	ControlPlane_ConfigureChain_FullMethodName  = "/razpravljalnica.ControlPlane/ConfigureChain"
-	ControlPlane_Heartbeat_FullMethodName       = "/razpravljalnica.ControlPlane/Heartbeat"
-	ControlPlane_Join_FullMethodName            = "/razpravljalnica.ControlPlane/Join"
-	ControlPlane_Leave_FullMethodName           = "/razpravljalnica.ControlPlane/Leave"
+	ControlPlane_GetClusterState_FullMethodName    = "/razpravljalnica.ControlPlane/GetClusterState"
+	ControlPlane_ConfigureChain_FullMethodName     = "/razpravljalnica.ControlPlane/ConfigureChain"
+	ControlPlane_Heartbeat_FullMethodName          = "/razpravljalnica.ControlPlane/Heartbeat"
+	ControlPlane_Join_FullMethodName               = "/razpravljalnica.ControlPlane/Join"
+	ControlPlane_Leave_FullMethodName              = "/razpravljalnica.ControlPlane/Leave"
+	ControlPlane_GetLeastLoadedNode_FullMethodName = "/razpravljalnica.ControlPlane/GetLeastLoadedNode"
 )
 
 // ControlPlaneClient is the client API for ControlPlane service.
@@ -686,6 +687,7 @@ type ControlPlaneClient interface {
 	Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error)
 	Join(ctx context.Context, in *JoinRequest, opts ...grpc.CallOption) (*JoinResponse, error)
 	Leave(ctx context.Context, in *LeaveRequest, opts ...grpc.CallOption) (*LeaveResponse, error)
+	GetLeastLoadedNode(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*NodeInfo, error)
 }
 
 type controlPlaneClient struct {
@@ -746,6 +748,16 @@ func (c *controlPlaneClient) Leave(ctx context.Context, in *LeaveRequest, opts .
 	return out, nil
 }
 
+func (c *controlPlaneClient) GetLeastLoadedNode(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*NodeInfo, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(NodeInfo)
+	err := c.cc.Invoke(ctx, ControlPlane_GetLeastLoadedNode_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ControlPlaneServer is the server API for ControlPlane service.
 // All implementations must embed UnimplementedControlPlaneServer
 // for forward compatibility.
@@ -755,6 +767,7 @@ type ControlPlaneServer interface {
 	Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
 	Join(context.Context, *JoinRequest) (*JoinResponse, error)
 	Leave(context.Context, *LeaveRequest) (*LeaveResponse, error)
+	GetLeastLoadedNode(context.Context, *emptypb.Empty) (*NodeInfo, error)
 	mustEmbedUnimplementedControlPlaneServer()
 }
 
@@ -779,6 +792,9 @@ func (UnimplementedControlPlaneServer) Join(context.Context, *JoinRequest) (*Joi
 }
 func (UnimplementedControlPlaneServer) Leave(context.Context, *LeaveRequest) (*LeaveResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Leave not implemented")
+}
+func (UnimplementedControlPlaneServer) GetLeastLoadedNode(context.Context, *emptypb.Empty) (*NodeInfo, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetLeastLoadedNode not implemented")
 }
 func (UnimplementedControlPlaneServer) mustEmbedUnimplementedControlPlaneServer() {}
 func (UnimplementedControlPlaneServer) testEmbeddedByValue()                      {}
@@ -891,6 +907,24 @@ func _ControlPlane_Leave_Handler(srv interface{}, ctx context.Context, dec func(
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ControlPlane_GetLeastLoadedNode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServer).GetLeastLoadedNode(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlane_GetLeastLoadedNode_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServer).GetLeastLoadedNode(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ControlPlane_ServiceDesc is the grpc.ServiceDesc for ControlPlane service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -917,6 +951,10 @@ var ControlPlane_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Leave",
 			Handler:    _ControlPlane_Leave_Handler,
+		},
+		{
+			MethodName: "GetLeastLoadedNode",
+			Handler:    _ControlPlane_GetLeastLoadedNode_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

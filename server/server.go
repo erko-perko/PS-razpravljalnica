@@ -25,10 +25,9 @@ import (
 )
 
 type subscription struct {
-	id      int64
-	userID  int64
 	topics  map[int64]struct{}
 	channel chan *pb.MessageEvent
+	nodeID  string
 }
 
 type tokenPayload struct {
@@ -86,16 +85,15 @@ type messageBoardServer struct {
 	ackChannels map[int64]chan struct{}
 
 	// Load balancing for subscriptions at head
-	nodeSubCount map[string]int64
+	subCount atomic.Int64
 
 	// Token signing
 	tokenSecret []byte
 
-	// Stop channels
-	stopCh chan struct{}
-
 	// Head readiness gate (when a node becomes head after reconfiguration)
 	headReady atomic.Bool
+
+	pendingAcks map[int64]struct{}
 }
 
 func newMessageBoardServer(nodeID, address, controlAddr, tokenSecret string) *messageBoardServer {
@@ -116,33 +114,72 @@ func newMessageBoardServer(nodeID, address, controlAddr, tokenSecret string) *me
 		logEntries:    make(map[int64]*pb.LogEntry),
 		requestToSeq:  make(map[string]int64),
 		ackChannels:   make(map[int64]chan struct{}),
-		nodeSubCount:  make(map[string]int64),
 		tokenSecret:   []byte(tokenSecret),
-		stopCh:        make(chan struct{}),
+		pendingAcks:   make(map[int64]struct{}),
 	}
+	s.subCount.Store(0)
 	// If single node (initially), it's both head and tail, so head is ready.
 	s.headReady.Store(true)
 	return s
 }
 
-func (s *messageBoardServer) isHeadLocked() bool {
-	return s.address == s.headAddress
+func (s *messageBoardServer) applyCommittedFlag(seq int64) {
+	entry, ok := s.logEntries[seq]
+	if !ok {
+		return
+	}
+	switch entry.GetOp() {
+	case pb.OpType_OP_CREATE_USER:
+		u := entry.GetUser()
+		if u != nil {
+			if ex, ok := s.users[u.GetId()]; ok {
+				ex.Committed = true
+			}
+		}
+	case pb.OpType_OP_CREATE_TOPIC:
+		t := entry.GetTopic()
+		if t != nil {
+			if ex, ok := s.topics[t.GetId()]; ok {
+				ex.Committed = true
+			}
+		}
+	case pb.OpType_OP_POST, pb.OpType_OP_UPDATE, pb.OpType_OP_DELETE, pb.OpType_OP_LIKE:
+		m := entry.GetMessage()
+		if m != nil {
+			if tm, ok := s.messages[m.GetTopicId()]; ok {
+				if ex, ok := tm[m.GetId()]; ok {
+					ex.Committed = true
+				}
+			}
+		}
+	}
 }
 
-func (s *messageBoardServer) isTailLocked() bool {
-	return s.address == s.tailAddress
+func (s *messageBoardServer) noteAck(seq int64) {
+	if seq <= s.lastCommittedSeq {
+		return
+	}
+	s.pendingAcks[seq] = struct{}{}
+	for {
+		next := s.lastCommittedSeq + 1
+		if _, ok := s.pendingAcks[next]; !ok {
+			return
+		}
+		delete(s.pendingAcks, next)
+		s.lastCommittedSeq = next
+		s.applyCommittedFlag(next)
+	}
 }
 
 func (s *messageBoardServer) isHead() bool {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
-	return s.isHeadLocked()
+	return s.address == s.headAddress
 }
-
 func (s *messageBoardServer) isTail() bool {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
-	return s.isTailLocked()
+	return s.address == s.tailAddress
 }
 
 func (s *messageBoardServer) requireHeadReady() error {
@@ -201,7 +238,7 @@ func (s *messageBoardServer) signalAck(seq int64) {
 	}
 }
 
-func (s *messageBoardServer) validateAndAdvanceSeqLocked(seq int64) error {
+func (s *messageBoardServer) validateSeqLocked(seq int64) error {
 	// Accept duplicates (idempotent propagation); ignore if already applied.
 	if seq <= s.lastAppliedSeq {
 		return nil
@@ -223,7 +260,7 @@ func (s *messageBoardServer) applyEntryLocked(entry *pb.LogEntry) error {
 	}
 
 	// Ensure order
-	if err := s.validateAndAdvanceSeqLocked(seq); err != nil {
+	if err := s.validateSeqLocked(seq); err != nil {
 		return err
 	}
 
@@ -350,6 +387,9 @@ func (s *messageBoardServer) applyEntryLocked(entry *pb.LogEntry) error {
 		ex.SequenceNumber = seq
 		ev := s.newMessageEventLocked(pb.OpType_OP_DELETE, ex, seq)
 		delete(tm, m.GetId())
+		if evMap, ok := s.postEvents[topicID]; ok {
+			delete(evMap, m.GetId())
+		}
 		s.broadcastEventLocked(ev)
 
 	case pb.OpType_OP_LIKE:
@@ -386,44 +426,6 @@ func (s *messageBoardServer) applyEntryLocked(entry *pb.LogEntry) error {
 	return nil
 }
 
-func (s *messageBoardServer) markCommittedLocked(seq int64) {
-	if seq <= s.lastCommittedSeq {
-		return
-	}
-	s.lastCommittedSeq = seq
-
-	entry, ok := s.logEntries[seq]
-	if !ok {
-		return
-	}
-
-	switch entry.GetOp() {
-	case pb.OpType_OP_CREATE_USER:
-		u := entry.GetUser()
-		if u != nil {
-			if ex, ok := s.users[u.GetId()]; ok {
-				ex.Committed = true
-			}
-		}
-	case pb.OpType_OP_CREATE_TOPIC:
-		t := entry.GetTopic()
-		if t != nil {
-			if ex, ok := s.topics[t.GetId()]; ok {
-				ex.Committed = true
-			}
-		}
-	case pb.OpType_OP_POST, pb.OpType_OP_UPDATE, pb.OpType_OP_DELETE, pb.OpType_OP_LIKE:
-		m := entry.GetMessage()
-		if m != nil {
-			if tm, ok := s.messages[m.GetTopicId()]; ok {
-				if ex, ok := tm[m.GetId()]; ok {
-					ex.Committed = true
-				}
-			}
-		}
-	}
-}
-
 func (s *messageBoardServer) newMessageEventLocked(op pb.OpType, msg *pb.Message, seq int64) *pb.MessageEvent {
 	return &pb.MessageEvent{
 		SequenceNumber: seq,
@@ -455,7 +457,15 @@ func (s *messageBoardServer) removeSubscription(id int64) {
 	if sub, ok := s.subscribers[id]; ok {
 		delete(s.subscribers, id)
 		close(sub.channel)
+		s.subCount.Add(-1)
 	}
+}
+
+func (s *messageBoardServer) requireNodeReady() error {
+	if !s.headReady.Load() {
+		return fmt.Errorf("node is not ready yet (catch-up in progress)")
+	}
+	return nil
 }
 
 func (s *messageBoardServer) getEntryByRequestIDLocked(requestID string) (*pb.LogEntry, bool) {
@@ -470,10 +480,16 @@ func (s *messageBoardServer) getEntryByRequestIDLocked(requestID string) (*pb.Lo
 func (s *messageBoardServer) propagateToSuccessor(ctx context.Context, entry *pb.LogEntry) error {
 	s.lock.RLock()
 	client := s.successorClient
+	isTail := s.address == s.tailAddress
 	s.lock.RUnlock()
+
 	if client == nil {
-		return nil
+		if isTail {
+			return nil
+		}
+		return fmt.Errorf("no successor client (not tail)")
 	}
+
 	_, err := client.PropagateEntry(ctx, entry)
 	return err
 }
@@ -482,7 +498,7 @@ func (s *messageBoardServer) reportNodeFailure(nodeID string) {
 	if strings.TrimSpace(s.controlAddr) == "" {
 		return
 	}
-	conn, err := grpc.Dial(s.controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(s.controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return
 	}
@@ -535,7 +551,7 @@ func (s *messageBoardServer) sendAckToPredecessor(ctx context.Context, seq int64
 	if pred == nil {
 		return
 	}
-	conn, err := grpc.Dial(pred.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(pred.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return
 	}
@@ -551,12 +567,16 @@ func (s *messageBoardServer) catchUpFromPredecessor() {
 	s.lock.RUnlock()
 
 	if pred == nil {
-		// No predecessor -> if we're head, we can become ready.
-		s.headReady.Store(true)
+		s.lock.RLock()
+		isHead := s.address == s.headAddress
+		s.lock.RUnlock()
+		if isHead {
+			s.headReady.Store(true)
+		}
 		return
 	}
 
-	conn, err := grpc.Dial(pred.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(pred.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Printf("[%s] catch-up dial failed: %v", s.nodeID, err)
 		return
@@ -581,7 +601,7 @@ func (s *messageBoardServer) catchUpFromPredecessor() {
 			return
 		}
 	}
-	isHead := s.isHeadLocked()
+	isHead := s.address == s.headAddress
 	s.lock.Unlock()
 
 	if isHead {
@@ -602,8 +622,6 @@ func (s *messageBoardServer) heartbeatLoop() {
 
 	for {
 		select {
-		case <-s.stopCh:
-			return
 		case <-ticker.C:
 			s.lock.RLock()
 			last := s.lastAppliedSeq
@@ -611,16 +629,18 @@ func (s *messageBoardServer) heartbeatLoop() {
 			nodeID := s.nodeID
 			s.lock.RUnlock()
 
-			conn, err := grpc.Dial(s.controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			conn, err := grpc.NewClient(s.controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 			if err != nil {
 				continue
 			}
+			subCount := s.subCount.Load()
 			client := pb.NewControlPlaneClient(conn)
 			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 			_, _ = client.Heartbeat(ctx, &pb.HeartbeatRequest{
 				NodeId:         nodeID,
 				Address:        addr,
 				LastAppliedSeq: last,
+				SubCount:       subCount,
 			})
 			cancel()
 			_ = conn.Close()
@@ -632,7 +652,7 @@ func (s *messageBoardServer) joinControlPlane() {
 	if strings.TrimSpace(s.controlAddr) == "" {
 		return
 	}
-	conn, err := grpc.Dial(s.controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(s.controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Printf("[%s] join dial failed: %v", s.nodeID, err)
 		return
@@ -649,12 +669,13 @@ func (s *messageBoardServer) joinControlPlane() {
 		return
 	}
 
-	_ = s.applyChainConfig(resp.GetChain())
+	if err := s.applyChainConfig(resp.GetChain()); err != nil {
+		log.Printf("[%s] applyChainConfig failed: %v", s.nodeID, err)
+	}
 }
 
 func (s *messageBoardServer) applyChainConfig(nodes []*pb.NodeInfo) error {
 	s.lock.Lock()
-	defer s.lock.Unlock()
 
 	oldHead := s.headAddress
 	oldPredAddr := ""
@@ -675,6 +696,7 @@ func (s *messageBoardServer) applyChainConfig(nodes []*pb.NodeInfo) error {
 			s.successorConn = nil
 		}
 		s.headReady.Store(true)
+		s.lock.Unlock()
 		return nil
 	}
 
@@ -696,6 +718,7 @@ func (s *messageBoardServer) applyChainConfig(nodes []*pb.NodeInfo) error {
 		s.headAddress = s.address
 		s.tailAddress = s.address
 		s.headReady.Store(true)
+		s.lock.Unlock()
 		return nil
 	}
 
@@ -723,24 +746,18 @@ func (s *messageBoardServer) applyChainConfig(nodes []*pb.NodeInfo) error {
 	}
 
 	if s.successor != nil {
-		conn, err := grpc.Dial(s.successor.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(s.successor.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
+			s.lock.Unlock()
 			return fmt.Errorf("failed to dial successor: %v", err)
 		}
 		s.successorConn = conn
 		s.successorClient = pb.NewMessageBoardClient(conn)
 	}
 
-	// Ensure sub count map for LB at head
-	for _, n := range nodes {
-		if _, ok := s.nodeSubCount[n.GetNodeId()]; !ok {
-			s.nodeSubCount[n.GetNodeId()] = 0
-		}
-	}
-
 	// Head readiness logic:
 	// If we became head, we must catch up first (if we have predecessor).
-	becameHead := (oldHead != s.headAddress && s.isHeadLocked()) || (oldHead == "" && s.isHeadLocked())
+	becameHead := (oldHead != s.headAddress && s.address == s.headAddress)
 	if becameHead {
 		s.headReady.Store(false)
 	}
@@ -751,6 +768,9 @@ func (s *messageBoardServer) applyChainConfig(nodes []*pb.NodeInfo) error {
 	}
 	if becameHead && s.predecessor == nil {
 		// Head with no predecessor -> immediately ready.
+		s.headReady.Store(true)
+	} else if !becameHead && predChanged && s.predecessor == nil {
+		// Predecessor disappeared → node is effectively head now
 		s.headReady.Store(true)
 	}
 
@@ -764,7 +784,11 @@ func (s *messageBoardServer) applyChainConfig(nodes []*pb.NodeInfo) error {
 		s.nodeID, s.headAddress, s.tailAddress,
 		s.predecessor != nil, s.successor != nil, predChanged, becameHead, oldPredAddr, newPredAddr)
 
-	if needCatchUp {
+	needCatchUpLocal := needCatchUp
+
+	s.lock.Unlock()
+
+	if needCatchUpLocal {
 		go s.catchUpFromPredecessor()
 	}
 
@@ -810,6 +834,7 @@ func (s *messageBoardServer) CreateUser(ctx context.Context, request *pb.CreateU
 	s.nextUserID++
 	id := s.nextUserID
 	seq := s.allocateSeqLocked()
+	s.prepareAck(seq)
 
 	user := &pb.User{Id: id, Name: name, SequenceNumber: seq, Committed: false}
 	entry := &pb.LogEntry{
@@ -823,7 +848,7 @@ func (s *messageBoardServer) CreateUser(ctx context.Context, request *pb.CreateU
 		s.lock.Unlock()
 		return nil, err
 	}
-	s.prepareAck(seq)
+
 	s.lock.Unlock()
 
 	if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
@@ -834,7 +859,7 @@ func (s *messageBoardServer) CreateUser(ctx context.Context, request *pb.CreateU
 	}
 
 	s.lock.Lock()
-	s.markCommittedLocked(seq)
+	s.noteAck(seq)
 	resp := s.users[id]
 	s.lock.Unlock()
 	return resp, nil
@@ -871,6 +896,7 @@ func (s *messageBoardServer) CreateTopic(ctx context.Context, request *pb.Create
 	s.nextTopicID++
 	id := s.nextTopicID
 	seq := s.allocateSeqLocked()
+	s.prepareAck(seq)
 
 	topic := &pb.Topic{Id: id, Name: name, SequenceNumber: seq, Committed: false}
 	entry := &pb.LogEntry{
@@ -884,7 +910,7 @@ func (s *messageBoardServer) CreateTopic(ctx context.Context, request *pb.Create
 		s.lock.Unlock()
 		return nil, err
 	}
-	s.prepareAck(seq)
+
 	s.lock.Unlock()
 
 	if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
@@ -895,7 +921,7 @@ func (s *messageBoardServer) CreateTopic(ctx context.Context, request *pb.Create
 	}
 
 	s.lock.Lock()
-	s.markCommittedLocked(seq)
+	s.noteAck(seq)
 	resp := s.topics[id]
 	s.lock.Unlock()
 	return resp, nil
@@ -924,9 +950,17 @@ func (s *messageBoardServer) PostMessage(ctx context.Context, request *pb.PostMe
 			s.lock.Unlock()
 			return nil, fmt.Errorf("stored entry missing message")
 		}
-		resp := s.messages[m.GetTopicId()][m.GetId()]
+
+		// Prefer current state if present, otherwise return snapshot from log entry.
+		if tm, ok := s.messages[m.GetTopicId()]; ok {
+			if resp, ok := tm[m.GetId()]; ok {
+				s.lock.Unlock()
+				return resp, nil
+			}
+		}
+
 		s.lock.Unlock()
-		return resp, nil
+		return m, nil
 	}
 
 	if _, ok := s.users[request.GetUserId()]; !ok {
@@ -944,6 +978,7 @@ func (s *messageBoardServer) PostMessage(ctx context.Context, request *pb.PostMe
 	s.nextMessageID[topicID]++
 	msgID := s.nextMessageID[topicID]
 	seq := s.allocateSeqLocked()
+	s.prepareAck(seq)
 
 	msg := &pb.Message{
 		Id:             msgID,
@@ -967,7 +1002,7 @@ func (s *messageBoardServer) PostMessage(ctx context.Context, request *pb.PostMe
 		s.lock.Unlock()
 		return nil, err
 	}
-	s.prepareAck(seq)
+
 	s.lock.Unlock()
 
 	if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
@@ -978,7 +1013,7 @@ func (s *messageBoardServer) PostMessage(ctx context.Context, request *pb.PostMe
 	}
 
 	s.lock.Lock()
-	s.markCommittedLocked(seq)
+	s.noteAck(seq)
 	resp := s.messages[topicID][msgID]
 	s.lock.Unlock()
 	return resp, nil
@@ -1007,9 +1042,17 @@ func (s *messageBoardServer) UpdateMessage(ctx context.Context, request *pb.Upda
 			s.lock.Unlock()
 			return nil, fmt.Errorf("stored entry missing message")
 		}
-		resp := s.messages[m.GetTopicId()][m.GetId()]
+
+		// Prefer current state if present, otherwise return snapshot from log entry.
+		if tm, ok := s.messages[m.GetTopicId()]; ok {
+			if resp, ok := tm[m.GetId()]; ok {
+				s.lock.Unlock()
+				return resp, nil
+			}
+		}
+
 		s.lock.Unlock()
-		return resp, nil
+		return m, nil
 	}
 
 	if _, ok := s.users[request.GetUserId()]; !ok {
@@ -1032,6 +1075,8 @@ func (s *messageBoardServer) UpdateMessage(ctx context.Context, request *pb.Upda
 	}
 
 	seq := s.allocateSeqLocked()
+	s.prepareAck(seq)
+
 	snapshot := &pb.Message{
 		Id:             ex.GetId(),
 		TopicId:        ex.GetTopicId(),
@@ -1054,7 +1099,7 @@ func (s *messageBoardServer) UpdateMessage(ctx context.Context, request *pb.Upda
 		s.lock.Unlock()
 		return nil, err
 	}
-	s.prepareAck(seq)
+
 	s.lock.Unlock()
 
 	if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
@@ -1065,7 +1110,7 @@ func (s *messageBoardServer) UpdateMessage(ctx context.Context, request *pb.Upda
 	}
 
 	s.lock.Lock()
-	s.markCommittedLocked(seq)
+	s.noteAck(seq)
 	resp := s.messages[request.GetTopicId()][request.GetMessageId()]
 	s.lock.Unlock()
 	return resp, nil
@@ -1109,6 +1154,8 @@ func (s *messageBoardServer) DeleteMessage(ctx context.Context, request *pb.Dele
 	}
 
 	seq := s.allocateSeqLocked()
+	s.prepareAck(seq)
+
 	snapshot := &pb.Message{
 		Id:             ex.GetId(),
 		TopicId:        ex.GetTopicId(),
@@ -1130,7 +1177,7 @@ func (s *messageBoardServer) DeleteMessage(ctx context.Context, request *pb.Dele
 		s.lock.Unlock()
 		return nil, err
 	}
-	s.prepareAck(seq)
+
 	s.lock.Unlock()
 
 	if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
@@ -1141,7 +1188,7 @@ func (s *messageBoardServer) DeleteMessage(ctx context.Context, request *pb.Dele
 	}
 
 	s.lock.Lock()
-	s.markCommittedLocked(seq)
+	s.noteAck(seq)
 	s.lock.Unlock()
 	return &emptypb.Empty{}, nil
 }
@@ -1165,9 +1212,17 @@ func (s *messageBoardServer) LikeMessage(ctx context.Context, request *pb.LikeMe
 			s.lock.Unlock()
 			return nil, fmt.Errorf("stored entry missing message")
 		}
-		resp := s.messages[m.GetTopicId()][m.GetId()]
+
+		// Prefer current state if present, otherwise return snapshot from log entry.
+		if tm, ok := s.messages[m.GetTopicId()]; ok {
+			if resp, ok := tm[m.GetId()]; ok {
+				s.lock.Unlock()
+				return resp, nil
+			}
+		}
+
 		s.lock.Unlock()
-		return resp, nil
+		return m, nil
 	}
 
 	if _, ok := s.users[request.GetUserId()]; !ok {
@@ -1186,6 +1241,8 @@ func (s *messageBoardServer) LikeMessage(ctx context.Context, request *pb.LikeMe
 	}
 
 	seq := s.allocateSeqLocked()
+	s.prepareAck(seq)
+
 	snapshot := &pb.Message{
 		Id:             ex.GetId(),
 		TopicId:        ex.GetTopicId(),
@@ -1207,7 +1264,7 @@ func (s *messageBoardServer) LikeMessage(ctx context.Context, request *pb.LikeMe
 		s.lock.Unlock()
 		return nil, err
 	}
-	s.prepareAck(seq)
+
 	s.lock.Unlock()
 
 	if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
@@ -1218,7 +1275,7 @@ func (s *messageBoardServer) LikeMessage(ctx context.Context, request *pb.LikeMe
 	}
 
 	s.lock.Lock()
-	s.markCommittedLocked(seq)
+	s.noteAck(seq)
 	resp := s.messages[request.GetTopicId()][request.GetMessageId()]
 	s.lock.Unlock()
 	return resp, nil
@@ -1294,35 +1351,31 @@ func (s *messageBoardServer) GetSubscriptionNode(ctx context.Context, request *p
 		return nil, err
 	}
 
-	s.lock.Lock()
-	defer s.lock.Unlock()
+	s.lock.RLock()
+	controlAddr := s.controlAddr
+	s.lock.RUnlock()
 
-	if _, ok := s.users[request.GetUserId()]; !ok {
-		return nil, fmt.Errorf("user %d does not exist", request.GetUserId())
-	}
-	if len(request.GetTopicId()) == 0 {
-		return nil, fmt.Errorf("at least one topic required")
+	if strings.TrimSpace(controlAddr) == "" {
+		return nil, fmt.Errorf("control plane address not set")
 	}
 
-	var selected *pb.NodeInfo
-	min := int64(-1)
-
-	if len(s.chain) == 0 {
-		selected = &pb.NodeInfo{NodeId: s.nodeID, Address: s.address}
-	} else {
-		for _, n := range s.chain {
-			c := s.nodeSubCount[n.GetNodeId()]
-			if min == -1 || c < min {
-				min = c
-				selected = n
-			}
-		}
+	conn, err := grpc.NewClient(controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, fmt.Errorf("failed to dial control plane: %v", err)
 	}
-	if selected == nil {
-		selected = &pb.NodeInfo{NodeId: s.nodeID, Address: s.address}
-	}
-	s.nodeSubCount[selected.GetNodeId()]++
+	defer conn.Close()
 
+	cpClient := pb.NewControlPlaneClient(conn)
+	cpCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel()
+
+	node, err := cpClient.GetLeastLoadedNode(cpCtx, &emptypb.Empty{})
+	if err != nil || node == nil || node.GetAddress() == "" {
+		// fallback: head sam
+		node = &pb.NodeInfo{NodeId: s.nodeID, Address: s.address}
+	}
+
+	// token še vedno podpiše head
 	token, err := s.makeSubscribeToken(request.GetUserId(), request.GetTopicId(), time.Now().Add(10*time.Minute).Unix())
 	if err != nil {
 		return nil, err
@@ -1330,7 +1383,7 @@ func (s *messageBoardServer) GetSubscriptionNode(ctx context.Context, request *p
 
 	return &pb.SubscriptionNodeResponse{
 		SubscribeToken: token,
-		Node:           selected,
+		Node:           node,
 	}, nil
 }
 
@@ -1341,10 +1394,7 @@ func (s *messageBoardServer) SubscribeTopic(request *pb.SubscribeTopicRequest, s
 		return err
 	}
 
-	topics := request.GetTopicId()
-	if len(topics) == 0 {
-		topics = topicsFromToken
-	}
+	topics := topicsFromToken
 
 	topicsSet := make(map[int64]struct{}, len(topics))
 	for _, t := range topics {
@@ -1355,11 +1405,11 @@ func (s *messageBoardServer) SubscribeTopic(request *pb.SubscribeTopicRequest, s
 	s.nextSubID++
 	subID := s.nextSubID
 	sub := &subscription{
-		id:      subID,
-		userID:  request.GetUserId(),
 		topics:  topicsSet,
 		channel: make(chan *pb.MessageEvent, 64),
+		nodeID:  s.nodeID,
 	}
+	s.subCount.Add(1)
 	s.subscribers[subID] = sub
 
 	fromID := request.GetFromMessageId()
@@ -1408,6 +1458,7 @@ func (s *messageBoardServer) SubscribeTopic(request *pb.SubscribeTopicRequest, s
 			return nil
 		case ev, ok := <-sub.channel:
 			if !ok {
+				s.removeSubscription(subID)
 				return nil
 			}
 			s.lock.RLock()
@@ -1429,24 +1480,30 @@ func (s *messageBoardServer) SubscribeTopic(request *pb.SubscribeTopicRequest, s
 ////////////////////////////////////////////////////////////////////////////////
 
 func (s *messageBoardServer) PropagateEntry(ctx context.Context, entry *pb.LogEntry) (*emptypb.Empty, error) {
+	if err := s.requireNodeReady(); err != nil {
+		return nil, err
+	}
 	s.lock.Lock()
 	if err := s.applyEntryLocked(entry); err != nil {
 		s.lock.Unlock()
 		return nil, err
 	}
-	isTail := s.isTailLocked()
+	isTail := s.address == s.tailAddress
+	hasSucc := s.successorClient != nil
 	s.lock.Unlock()
 
 	// Forward to successor with retry (lets CP rewire chain on failure)
-	if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
-		// If we cannot forward and we're not tail, caller should retry after chain reconfig.
-		// We still keep the entry locally; it will be forwarded once successor changes.
-		return nil, err
+	if hasSucc {
+		if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
+			// If we cannot forward and we're not tail, caller should retry after chain reconfig.
+			// We still keep the entry locally; it will be forwarded once successor changes.
+			return nil, err
+		}
 	}
 
 	if isTail {
 		s.lock.Lock()
-		s.markCommittedLocked(entry.GetSequenceNumber())
+		s.noteAck(entry.GetSequenceNumber())
 		s.lock.Unlock()
 		s.sendAckToPredecessor(ctx, entry.GetSequenceNumber())
 	}
@@ -1458,8 +1515,8 @@ func (s *messageBoardServer) Ack(ctx context.Context, request *pb.AckRequest) (*
 	seq := request.GetSequenceNumber()
 
 	s.lock.Lock()
-	s.markCommittedLocked(seq)
-	isHead := s.isHeadLocked()
+	s.noteAck(seq)
+	isHead := s.address == s.headAddress
 	s.lock.Unlock()
 
 	if isHead {
