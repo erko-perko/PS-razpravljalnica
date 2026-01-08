@@ -1,467 +1,1315 @@
-// ali se lahko kreira več uporabnikov z istim imenom
 package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	pb "razpravljalnica/pb" //import pb.go datoteke
+	pb "razpravljalnica/pb"
 
-	"google.golang.org/grpc" //glavna knjižnica za grpc
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/protobuf/types/known/emptypb"     //import zaradi google.protobuf.Empty, ki ga uporabimo v metodah, kazalec na "nic"
-	"google.golang.org/protobuf/types/known/timestamppb" //uporabimo zaradi create_at, event_at
+	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// struktura za beleženje naročnine za specifičen topic
-type SubscriptionTokenInfo struct {
-	UserID int64
-	Topics []int64
-}
-
-// struktura za naročnino
 type subscription struct {
-	id      int64
-	userID  int64
 	topics  map[int64]struct{}
 	channel chan *pb.MessageEvent
+	nodeID  string
 }
 
-/*
-Glavna struktura strežnika
--baza (users, topics, messages)
--subscription kanali
--mutex (zaklepanje)
--ID generatorji
--vse RPC metode
-*/
+type tokenPayload struct {
+	UserID int64   `json:"user_id"`
+	Topics []int64 `json:"topics"`
+	Exp    int64   `json:"exp"`
+}
+
 type messageBoardServer struct {
 	pb.UnimplementedMessageBoardServer
-	pb.UnimplementedControlPlaneServer
 
-	lock sync.RWMutex // zaklep za varno delo z mapami iz več gorutin
+	lock sync.RWMutex
 
-	//baza v pomnilniku
-	users       map[int64]*pb.User
-	topics      map[int64]*pb.Topic
-	messages    map[int64]map[int64]*pb.Message   // topicID -> messageID -> Message
-	tokens      map[string]*SubscriptionTokenInfo //shranjevanje naročniških tokenov
-	nextTokenID int64
-
-	// števci za generiranje ID-jev
+	// In-memory DB
+	users         map[int64]*pb.User
+	userNameToID  map[string]int64
+	topics        map[int64]*pb.Topic
+	messages      map[int64]map[int64]*pb.Message // topicID -> messageID -> Message
 	nextUserID    int64
 	nextTopicID   int64
-	nextMessageID map[int64]int64 //messagei bodo imeli svoj ID glede na topic, vsak topic se začne z messageId = 0
+	nextMessageID map[int64]int64
 
-	// identiteta tega vozlišča (za ControlPlane)
-	nodeID  string
-	address string
-
-	// chain replication
-	successor             *pb.NodeInfo          // naslednje vozlišče v verigi
-	predecessor           *pb.NodeInfo          // prejšnje vozlišče v verigi
-	chain                 []*pb.NodeInfo        // celotna veriga vozlišč
-	successorClient       pb.MessageBoardClient // gRPC klient za komunikacijo s successorjem
-	nodeSubscriptionCount map[string]int64      // število naročnin na vozlišče (za load balancing)
-	headAddress           string                // address of the head node
-	tailAddress           string                // address of the tail node
-
-	// naročnina
-	postEvents  map[int64]map[int64]*pb.MessageEvent
+	// Subscription
 	subscribers map[int64]*subscription
 	nextSubID   int64
-	nextSeq     int64
+	postEvents  map[int64]map[int64]*pb.MessageEvent // topicID -> messageID -> event backlog
 
-	// acknowledgment tracking for two-phase commit
-	ackChannels map[int64]chan bool // sequence_number -> acknowledgment channel
-	ackLock     sync.Mutex          // separate lock for ack channels
+	// Chain state
+	nodeID      string
+	address     string
+	controlAddr string
 
-	// sequence number validation
-	lastSeqNumber int64 // last sequence number received (for validating order)
+	chain       []*pb.NodeInfo
+	headAddress string
+	tailAddress string
+
+	predecessor *pb.NodeInfo
+	successor   *pb.NodeInfo
+
+	successorConn   *grpc.ClientConn
+	successorClient pb.MessageBoardClient
+
+	// Sequence & log
+	nextSeq          int64
+	lastAppliedSeq   int64
+	lastCommittedSeq int64
+
+	logEntries map[int64]*pb.LogEntry // seq -> entry (all applied, committed or not)
+
+	// Idempotency: request_id -> seq
+	requestToSeq map[string]int64
+
+	// Ack waiting at head: seq -> chan
+	ackLock     sync.Mutex
+	ackChannels map[int64]chan struct{}
+
+	// Load balancing for subscriptions at head
+	subCount atomic.Int64
+
+	// Token signing
+	tokenSecret []byte
+
+	// Head readiness gate (when a node becomes head after reconfiguration)
+	headReady atomic.Bool
+
+	pendingAcks map[int64]struct{}
 }
 
-// ustvari preprost naključni token; kliče se pod lockom
-func (s *messageBoardServer) newSubscribeToken(userID int64, topics []int64) string {
-	s.nextTokenID++
-
-	token := fmt.Sprintf("token-%d-%d", userID, s.nextTokenID)
-
-	s.tokens[token] = &SubscriptionTokenInfo{
-		UserID: userID,
-		Topics: append([]int64(nil), topics...),
+func newMessageBoardServer(nodeID, address, controlAddr, tokenSecret string) *messageBoardServer {
+	s := &messageBoardServer{
+		users:         make(map[int64]*pb.User),
+		userNameToID:  make(map[string]int64),
+		topics:        make(map[int64]*pb.Topic),
+		messages:      make(map[int64]map[int64]*pb.Message),
+		nextMessageID: make(map[int64]int64),
+		subscribers:   make(map[int64]*subscription),
+		postEvents:    make(map[int64]map[int64]*pb.MessageEvent),
+		chain:         make([]*pb.NodeInfo, 0),
+		nodeID:        nodeID,
+		address:       address,
+		controlAddr:   controlAddr,
+		headAddress:   address,
+		tailAddress:   address,
+		logEntries:    make(map[int64]*pb.LogEntry),
+		requestToSeq:  make(map[string]int64),
+		ackChannels:   make(map[int64]chan struct{}),
+		tokenSecret:   []byte(tokenSecret),
+		pendingAcks:   make(map[int64]struct{}),
 	}
-	return token
+	s.subCount.Store(0)
+	// If single node (initially), it's both head and tail, so head is ready.
+	s.headReady.Store(true)
+	return s
 }
 
-// allocateSeqNumber allocates a new sequence number for an operation
-func (s *messageBoardServer) allocateSeqNumber() int64 {
+func (s *messageBoardServer) applyCommittedFlag(seq int64) {
+	entry, ok := s.logEntries[seq]
+	if !ok {
+		return
+	}
+	switch entry.GetOp() {
+	case pb.OpType_OP_CREATE_USER:
+		u := entry.GetUser()
+		if u != nil {
+			if ex, ok := s.users[u.GetId()]; ok {
+				ex.Committed = true
+			}
+		}
+	case pb.OpType_OP_CREATE_TOPIC:
+		t := entry.GetTopic()
+		if t != nil {
+			if ex, ok := s.topics[t.GetId()]; ok {
+				ex.Committed = true
+			}
+		}
+	case pb.OpType_OP_POST, pb.OpType_OP_UPDATE, pb.OpType_OP_DELETE, pb.OpType_OP_LIKE:
+		m := entry.GetMessage()
+		if m != nil {
+			if tm, ok := s.messages[m.GetTopicId()]; ok {
+				if ex, ok := tm[m.GetId()]; ok {
+					ex.Committed = true
+				}
+			}
+		}
+	}
+}
+
+func (s *messageBoardServer) noteAck(seq int64) {
+	if seq <= s.lastCommittedSeq {
+		return
+	}
+	s.pendingAcks[seq] = struct{}{}
+	for {
+		next := s.lastCommittedSeq + 1
+		if _, ok := s.pendingAcks[next]; !ok {
+			return
+		}
+		delete(s.pendingAcks, next)
+		s.lastCommittedSeq = next
+		s.applyCommittedFlag(next)
+	}
+}
+
+func (s *messageBoardServer) isHead() bool {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	return s.address == s.headAddress
+}
+func (s *messageBoardServer) isTail() bool {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	return s.address == s.tailAddress
+}
+
+func (s *messageBoardServer) requireHeadReady() error {
+	if !s.headReady.Load() {
+		return fmt.Errorf("head is not ready yet (catch-up in progress)")
+	}
+	return nil
+}
+
+func (s *messageBoardServer) allocateSeqLocked() int64 {
 	s.nextSeq++
 	return s.nextSeq
 }
 
-// prepareAck creates an acknowledgment channel for a sequence number
-func (s *messageBoardServer) prepareAck(seqNum int64) {
+func (s *messageBoardServer) prepareAck(seq int64) {
 	s.ackLock.Lock()
 	defer s.ackLock.Unlock()
-	if s.isTail() {
+	if _, ok := s.ackChannels[seq]; ok {
 		return
 	}
-	s.ackChannels[seqNum] = make(chan bool, 1)
+	s.ackChannels[seq] = make(chan struct{}, 1)
 }
 
-// waitForAck waits for acknowledgment from tail with timeout
-func (s *messageBoardServer) waitForAck(seqNum int64) bool {
+func (s *messageBoardServer) waitAck(seq int64, timeout time.Duration) bool {
 	s.ackLock.Lock()
-
-	// if we are tail, no need to wait
-	if s.isTail() {
-		s.ackLock.Unlock()
-		return true
-	}
-
-	// get acknowledgment channel
-	ackChan, ok := s.ackChannels[seqNum]
+	ch, ok := s.ackChannels[seq]
 	s.ackLock.Unlock()
-
 	if !ok {
 		return false
 	}
 
 	select {
-	case <-ackChan:
-		// Clean up the channel after receiving
+	case <-ch:
 		s.ackLock.Lock()
-		delete(s.ackChannels, seqNum)
+		delete(s.ackChannels, seq)
 		s.ackLock.Unlock()
 		return true
-	case <-time.After(5 * time.Second):
-		// cleanup channel on timeout
+	case <-time.After(timeout):
 		s.ackLock.Lock()
-		delete(s.ackChannels, seqNum)
+		delete(s.ackChannels, seq)
 		s.ackLock.Unlock()
 		return false
 	}
 }
 
-// sendAck sends acknowledgment signal for a sequence number
-func (s *messageBoardServer) sendAck(seqNum int64) {
+func (s *messageBoardServer) signalAck(seq int64) {
 	s.ackLock.Lock()
-	defer s.ackLock.Unlock()
-
-	if ackChan, ok := s.ackChannels[seqNum]; ok {
-		select {
-		case ackChan <- true:
-		default:
-		}
-		// Don't delete here - let waitForAck clean up after receiving
+	ch, ok := s.ackChannels[seq]
+	s.ackLock.Unlock()
+	if !ok {
+		return
+	}
+	select {
+	case ch <- struct{}{}:
+	default:
 	}
 }
 
-// validateSequenceNumber validates that the sequence number is the next expected one
-// Returns error if sequence number is out of order (more than 1 greater than last)
-func (s *messageBoardServer) validateSequenceNumber(seqNum int64) error {
-	if s.lastSeqNumber == 0 {
-		// First operation, accept any sequence number
-		s.lastSeqNumber = seqNum
+func (s *messageBoardServer) validateSeqLocked(seq int64) error {
+	// Accept duplicates (idempotent propagation); ignore if already applied.
+	if seq <= s.lastAppliedSeq {
 		return nil
 	}
-
-	if seqNum != s.lastSeqNumber+1 {
-		return fmt.Errorf("out of order operation: expected sequence %d, got %d", s.lastSeqNumber+1, seqNum)
+	// Must be exactly next
+	if seq != s.lastAppliedSeq+1 {
+		return fmt.Errorf("out of order: expected %d got %d", s.lastAppliedSeq+1, seq)
 	}
-
-	s.lastSeqNumber = seqNum
+	s.lastAppliedSeq = seq
 	return nil
 }
 
-// newMessageEvent uporabimo, da za naročnino zabeležimo vse evente, ki se zgodijo in jih broadcastamo vsem naročnikom
-func (s *messageBoardServer) newMessageEvent(op pb.OpType, message *pb.Message) *pb.MessageEvent {
+func (s *messageBoardServer) applyEntryLocked(entry *pb.LogEntry) error {
+	seq := entry.GetSequenceNumber()
+
+	// If already applied, do nothing (idempotent).
+	if _, ok := s.logEntries[seq]; ok {
+		return nil
+	}
+
+	// Ensure order
+	if err := s.validateSeqLocked(seq); err != nil {
+		return err
+	}
+
+	// Store in log
+	s.logEntries[seq] = entry
+
+	switch entry.GetOp() {
+	case pb.OpType_OP_CREATE_USER:
+		u := entry.GetUser()
+		if u == nil {
+			return fmt.Errorf("missing user in log entry")
+		}
+		// Enforce username uniqueness with map (idempotent safe)
+		if existingID, ok := s.userNameToID[u.GetName()]; ok {
+			if existingID != u.GetId() {
+				return fmt.Errorf("username taken")
+			}
+		} else {
+			s.userNameToID[u.GetName()] = u.GetId()
+		}
+		if u.GetId() > s.nextUserID {
+			s.nextUserID = u.GetId()
+		}
+		user := &pb.User{
+			Id:             u.GetId(),
+			Name:           u.GetName(),
+			SequenceNumber: seq,
+			Committed:      false,
+		}
+		s.users[user.Id] = user
+
+	case pb.OpType_OP_CREATE_TOPIC:
+		t := entry.GetTopic()
+		if t == nil {
+			return fmt.Errorf("missing topic in log entry")
+		}
+		if t.GetId() > s.nextTopicID {
+			s.nextTopicID = t.GetId()
+		}
+		topic := &pb.Topic{
+			Id:             t.GetId(),
+			Name:           t.GetName(),
+			SequenceNumber: seq,
+			Committed:      false,
+		}
+		s.topics[topic.Id] = topic
+
+		if _, ok := s.messages[topic.Id]; !ok {
+			s.messages[topic.Id] = make(map[int64]*pb.Message)
+		}
+		if _, ok := s.nextMessageID[topic.Id]; !ok {
+			s.nextMessageID[topic.Id] = 0
+		}
+		if _, ok := s.postEvents[topic.Id]; !ok {
+			s.postEvents[topic.Id] = make(map[int64]*pb.MessageEvent)
+		}
+
+	case pb.OpType_OP_POST:
+		m := entry.GetMessage()
+		if m == nil {
+			return fmt.Errorf("missing message in log entry")
+		}
+		topicID := m.GetTopicId()
+		if _, ok := s.messages[topicID]; !ok {
+			s.messages[topicID] = make(map[int64]*pb.Message)
+		}
+		if m.GetId() > s.nextMessageID[topicID] {
+			s.nextMessageID[topicID] = m.GetId()
+		}
+		msg := &pb.Message{
+			Id:             m.GetId(),
+			TopicId:        m.GetTopicId(),
+			UserId:         m.GetUserId(),
+			Text:           m.GetText(),
+			CreatedAt:      m.GetCreatedAt(),
+			Likes:          m.GetLikes(),
+			SequenceNumber: seq,
+			Committed:      false,
+		}
+		s.messages[topicID][msg.Id] = msg
+
+		ev := s.newMessageEventLocked(pb.OpType_OP_POST, msg, seq)
+		if _, ok := s.postEvents[topicID]; !ok {
+			s.postEvents[topicID] = make(map[int64]*pb.MessageEvent)
+		}
+		s.postEvents[topicID][msg.Id] = ev
+		s.broadcastEventLocked(ev)
+
+	case pb.OpType_OP_UPDATE:
+		m := entry.GetMessage()
+		if m == nil {
+			return fmt.Errorf("missing message in log entry")
+		}
+		topicID := m.GetTopicId()
+		tm, ok := s.messages[topicID]
+		if !ok {
+			return fmt.Errorf("topic %d does not exist", topicID)
+		}
+		ex, ok := tm[m.GetId()]
+		if !ok {
+			return fmt.Errorf("message %d does not exist", m.GetId())
+		}
+		ex.Text = m.GetText()
+		ex.SequenceNumber = seq
+		ex.Committed = false
+
+		ev := s.newMessageEventLocked(pb.OpType_OP_UPDATE, ex, seq)
+		s.broadcastEventLocked(ev)
+
+	case pb.OpType_OP_DELETE:
+		m := entry.GetMessage()
+		if m == nil {
+			return fmt.Errorf("missing message in log entry")
+		}
+		topicID := m.GetTopicId()
+		tm, ok := s.messages[topicID]
+		if !ok {
+			return fmt.Errorf("topic %d does not exist", topicID)
+		}
+		ex, ok := tm[m.GetId()]
+		if !ok {
+			return fmt.Errorf("message %d does not exist", m.GetId())
+		}
+		ex.SequenceNumber = seq
+		ev := s.newMessageEventLocked(pb.OpType_OP_DELETE, ex, seq)
+		delete(tm, m.GetId())
+		if evMap, ok := s.postEvents[topicID]; ok {
+			delete(evMap, m.GetId())
+		}
+		s.broadcastEventLocked(ev)
+
+	case pb.OpType_OP_LIKE:
+		m := entry.GetMessage()
+		if m == nil {
+			return fmt.Errorf("missing message in log entry")
+		}
+		topicID := m.GetTopicId()
+		tm, ok := s.messages[topicID]
+		if !ok {
+			return fmt.Errorf("topic %d does not exist", topicID)
+		}
+		ex, ok := tm[m.GetId()]
+		if !ok {
+			return fmt.Errorf("message %d does not exist", m.GetId())
+		}
+		ex.Likes++
+		ex.SequenceNumber = seq
+		ex.Committed = false
+
+		ev := s.newMessageEventLocked(pb.OpType_OP_LIKE, ex, seq)
+		s.broadcastEventLocked(ev)
+
+	default:
+		return fmt.Errorf("unknown op %v", entry.GetOp())
+	}
+
+	// Track request_id -> seq for idempotency if present
+	rid := strings.TrimSpace(entry.GetRequestId())
+	if rid != "" {
+		s.requestToSeq[rid] = seq
+	}
+
+	return nil
+}
+
+func (s *messageBoardServer) newMessageEventLocked(op pb.OpType, msg *pb.Message, seq int64) *pb.MessageEvent {
 	return &pb.MessageEvent{
-		SequenceNumber: s.nextSeq,
+		SequenceNumber: seq,
 		Op:             op,
-		Message:        message,
+		Message:        msg,
 		EventAt:        timestamppb.Now(),
 	}
 }
 
-// pošlje sporočilo o eventu vsem naročnikom, ki so naročeni na topic
-func (s *messageBoardServer) broadcastEvent(event *pb.MessageEvent) {
+func (s *messageBoardServer) broadcastEventLocked(event *pb.MessageEvent) {
 	if event.GetMessage() == nil {
 		return
 	}
 	topicID := event.GetMessage().GetTopicId()
-
-	for _, subscriber := range s.subscribers {
-		if _, ok := subscriber.topics[topicID]; !ok {
+	for _, sub := range s.subscribers {
+		if _, ok := sub.topics[topicID]; !ok {
 			continue
 		}
-		//select zaradi možnosti polnega kanala, da se ga izpusti
 		select {
-		case subscriber.channel <- event: //channel je vezan na subscription
+		case sub.channel <- event:
 		default:
-			//če je kanal poln ali prepočasen se ga izpusti
 		}
 	}
 }
 
-// RemoveSubscription zaustavi celoten kanal(subscription), če se naročnik odjavi od specifične teme.
-// Posledično se z zaprtjem kanal odjavi tudi od vseh ostalih tem, na katere se je prijavil z enim Subscription requestom
 func (s *messageBoardServer) removeSubscription(id int64) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
-
-	if subscriber, ok := s.subscribers[id]; ok {
+	if sub, ok := s.subscribers[id]; ok {
 		delete(s.subscribers, id)
-		close(subscriber.channel)
+		close(sub.channel)
+		s.subCount.Add(-1)
 	}
 }
 
-// CreateUser ustvari novega uporabnika in mu dodeli ID.
-// Write operacije so dovoljene samo na head vozlišču.
+func (s *messageBoardServer) requireNodeReady() error {
+	if !s.headReady.Load() {
+		return fmt.Errorf("node is not ready yet (catch-up in progress)")
+	}
+	return nil
+}
+
+func (s *messageBoardServer) getEntryByRequestIDLocked(requestID string) (*pb.LogEntry, bool) {
+	seq, ok := s.requestToSeq[requestID]
+	if !ok {
+		return nil, false
+	}
+	entry, ok := s.logEntries[seq]
+	return entry, ok
+}
+
+func (s *messageBoardServer) propagateToSuccessor(ctx context.Context, entry *pb.LogEntry) error {
+	s.lock.RLock()
+	client := s.successorClient
+	isTail := s.address == s.tailAddress
+	s.lock.RUnlock()
+
+	if client == nil {
+		if isTail {
+			return nil
+		}
+		return fmt.Errorf("no successor client (not tail)")
+	}
+
+	_, err := client.PropagateEntry(ctx, entry)
+	return err
+}
+
+func (s *messageBoardServer) reportNodeFailure(nodeID string) {
+	if strings.TrimSpace(s.controlAddr) == "" {
+		return
+	}
+	conn, err := grpc.NewClient(s.controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	client := pb.NewControlPlaneClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _ = client.Leave(ctx, &pb.LeaveRequest{NodeId: nodeID})
+}
+
+func (s *messageBoardServer) propagateWithRetry(ctx context.Context, entry *pb.LogEntry, maxRetries int) error {
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		err := s.propagateToSuccessor(ctx, entry)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+
+		s.lock.RLock()
+		succ := s.successor
+		s.lock.RUnlock()
+		if succ != nil {
+			log.Printf("[%s] propagate failed (%d/%d) to succ=%s: %v", s.nodeID, i+1, maxRetries, succ.GetNodeId(), err)
+			// Best-effort failure report (helps CP remove dead node and rewire chain)
+			s.reportNodeFailure(succ.GetNodeId())
+		} else {
+			log.Printf("[%s] propagate failed (%d/%d) no successor: %v", s.nodeID, i+1, maxRetries, err)
+		}
+
+		// backoff + allow chain reconfiguration to arrive
+		backoff := time.Duration(1<<uint(i)) * 200 * time.Millisecond
+		if backoff > 2*time.Second {
+			backoff = 2 * time.Second
+		}
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return fmt.Errorf("propagation failed after %d retries: %v", maxRetries, lastErr)
+}
+
+func (s *messageBoardServer) sendAckToPredecessor(ctx context.Context, seq int64) {
+	s.lock.RLock()
+	pred := s.predecessor
+	s.lock.RUnlock()
+	if pred == nil {
+		return
+	}
+	conn, err := grpc.NewClient(pred.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	client := pb.NewMessageBoardClient(conn)
+	_, _ = client.Ack(ctx, &pb.AckRequest{SequenceNumber: seq})
+}
+
+func (s *messageBoardServer) catchUpFromPredecessor() {
+	s.lock.RLock()
+	pred := s.predecessor
+	last := s.lastAppliedSeq
+	s.lock.RUnlock()
+
+	if pred == nil {
+		s.lock.RLock()
+		isHead := s.address == s.headAddress
+		s.lock.RUnlock()
+		if isHead {
+			s.headReady.Store(true)
+		}
+		return
+	}
+
+	conn, err := grpc.NewClient(pred.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Printf("[%s] catch-up dial failed: %v", s.nodeID, err)
+		return
+	}
+	defer conn.Close()
+	client := pb.NewMessageBoardClient(conn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := client.SyncFrom(ctx, &pb.SyncFromRequest{FromSeqExclusive: last})
+	if err != nil {
+		log.Printf("[%s] catch-up SyncFrom failed: %v", s.nodeID, err)
+		return
+	}
+
+	s.lock.Lock()
+	for _, e := range resp.GetEntries() {
+		if err := s.applyEntryLocked(e); err != nil {
+			log.Printf("[%s] catch-up apply failed: %v", s.nodeID, err)
+			s.lock.Unlock()
+			return
+		}
+	}
+	isHead := s.address == s.headAddress
+	s.lock.Unlock()
+
+	if isHead {
+		// After catch-up, head is ready to accept writes.
+		s.headReady.Store(true)
+	}
+
+	log.Printf("[%s] catch-up complete up to %d", s.nodeID, s.lastAppliedSeq)
+}
+
+func (s *messageBoardServer) heartbeatLoop() {
+	if strings.TrimSpace(s.controlAddr) == "" {
+		return
+	}
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.lock.RLock()
+			last := s.lastAppliedSeq
+			addr := s.address
+			nodeID := s.nodeID
+			s.lock.RUnlock()
+
+			conn, err := grpc.NewClient(s.controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				continue
+			}
+			subCount := s.subCount.Load()
+			client := pb.NewControlPlaneClient(conn)
+			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			_, _ = client.Heartbeat(ctx, &pb.HeartbeatRequest{
+				NodeId:         nodeID,
+				Address:        addr,
+				LastAppliedSeq: last,
+				SubCount:       subCount,
+			})
+			cancel()
+			_ = conn.Close()
+		}
+	}
+}
+
+func (s *messageBoardServer) joinControlPlane() {
+	if strings.TrimSpace(s.controlAddr) == "" {
+		return
+	}
+	conn, err := grpc.NewClient(s.controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Printf("[%s] join dial failed: %v", s.nodeID, err)
+		return
+	}
+	defer conn.Close()
+
+	client := pb.NewControlPlaneClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	resp, err := client.Join(ctx, &pb.JoinRequest{NodeId: s.nodeID, Address: s.address})
+	if err != nil {
+		log.Printf("[%s] join failed: %v", s.nodeID, err)
+		return
+	}
+
+	if err := s.applyChainConfig(resp.GetChain()); err != nil {
+		log.Printf("[%s] applyChainConfig failed: %v", s.nodeID, err)
+	}
+}
+
+func (s *messageBoardServer) applyChainConfig(nodes []*pb.NodeInfo) error {
+	s.lock.Lock()
+
+	oldHead := s.headAddress
+	oldPredAddr := ""
+	if s.predecessor != nil {
+		oldPredAddr = s.predecessor.GetAddress()
+	}
+
+	s.chain = nodes
+	if len(nodes) == 0 {
+		// standalone
+		s.headAddress = s.address
+		s.tailAddress = s.address
+		s.predecessor = nil
+		s.successor = nil
+		s.successorClient = nil
+		if s.successorConn != nil {
+			_ = s.successorConn.Close()
+			s.successorConn = nil
+		}
+		s.headReady.Store(true)
+		s.lock.Unlock()
+		return nil
+	}
+
+	s.headAddress = nodes[0].GetAddress()
+	s.tailAddress = nodes[len(nodes)-1].GetAddress()
+
+	// Find index
+	myIndex := -1
+	for i, n := range nodes {
+		if n.GetNodeId() == s.nodeID {
+			myIndex = i
+			break
+		}
+	}
+	if myIndex == -1 {
+		// Not in chain anymore - treat as standalone
+		s.predecessor = nil
+		s.successor = nil
+		s.headAddress = s.address
+		s.tailAddress = s.address
+		s.headReady.Store(true)
+		s.lock.Unlock()
+		return nil
+	}
+
+	var newPred *pb.NodeInfo
+	if myIndex > 0 {
+		newPred = nodes[myIndex-1]
+	}
+	var newSucc *pb.NodeInfo
+	if myIndex < len(nodes)-1 {
+		newSucc = nodes[myIndex+1]
+	}
+
+	predChanged := (s.predecessor == nil && newPred != nil) ||
+		(s.predecessor != nil && newPred == nil) ||
+		(s.predecessor != nil && newPred != nil && s.predecessor.GetAddress() != newPred.GetAddress())
+
+	s.predecessor = newPred
+	s.successor = newSucc
+
+	// Reset successor client connection if changed
+	if s.successorConn != nil {
+		_ = s.successorConn.Close()
+		s.successorConn = nil
+		s.successorClient = nil
+	}
+
+	if s.successor != nil {
+		conn, err := grpc.NewClient(s.successor.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			s.lock.Unlock()
+			return fmt.Errorf("failed to dial successor: %v", err)
+		}
+		s.successorConn = conn
+		s.successorClient = pb.NewMessageBoardClient(conn)
+	}
+
+	// Head readiness logic:
+	// If we became head, we must catch up first (if we have predecessor).
+	becameHead := (oldHead != s.headAddress && s.address == s.headAddress)
+	if becameHead {
+		s.headReady.Store(false)
+	}
+	// If predecessor changed, catch up.
+	needCatchUp := predChanged
+	if becameHead && s.predecessor != nil {
+		needCatchUp = true
+	}
+	if becameHead && s.predecessor == nil {
+		// Head with no predecessor -> immediately ready.
+		s.headReady.Store(true)
+	} else if !becameHead && predChanged && s.predecessor == nil {
+		// Predecessor disappeared → node is effectively head now
+		s.headReady.Store(true)
+	}
+
+	// unlock scope ends here; do catch-up async outside lock
+	newPredAddr := ""
+	if s.predecessor != nil {
+		newPredAddr = s.predecessor.GetAddress()
+	}
+
+	log.Printf("[%s] chain applied: head=%s tail=%s pred=%v succ=%v predChanged=%v becameHead=%v oldPred=%s newPred=%s",
+		s.nodeID, s.headAddress, s.tailAddress,
+		s.predecessor != nil, s.successor != nil, predChanged, becameHead, oldPredAddr, newPredAddr)
+
+	needCatchUpLocal := needCatchUp
+
+	s.lock.Unlock()
+
+	if needCatchUpLocal {
+		go s.catchUpFromPredecessor()
+	}
+
+	return nil
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// External API (head writes)
+////////////////////////////////////////////////////////////////////////////////
+
 func (s *messageBoardServer) CreateUser(ctx context.Context, request *pb.CreateUserRequest) (*pb.User, error) {
-	// samo head lahko sprejema write operacije
 	if !s.isHead() {
 		return nil, fmt.Errorf("write operations only allowed at head node")
 	}
-
-	if request.GetName() == "" {
+	if err := s.requireHeadReady(); err != nil {
+		return nil, err
+	}
+	name := strings.TrimSpace(request.GetName())
+	if name == "" {
 		return nil, fmt.Errorf("name not valid")
 	}
-
-	// zaklenemo za pisanje, ker bomo spreminjali stanje
-	s.lock.Lock()
-
-	//preverjanje unikatnosti imena
-	for _, user := range s.users {
-		if user.Name == request.GetName() {
-			s.lock.Unlock()
-			return nil, fmt.Errorf("username taken")
-		}
+	rid := strings.TrimSpace(request.GetRequestId())
+	if rid == "" {
+		return nil, fmt.Errorf("request_id required")
 	}
 
-	// generiramo nov ID in sequence number
+	s.lock.Lock()
+	if entry, ok := s.getEntryByRequestIDLocked(rid); ok {
+		u := entry.GetUser()
+		if u == nil {
+			s.lock.Unlock()
+			return nil, fmt.Errorf("stored entry missing user")
+		}
+		resp := s.users[u.GetId()]
+		s.lock.Unlock()
+		return resp, nil
+	}
+	if _, ok := s.userNameToID[name]; ok {
+		s.lock.Unlock()
+		return nil, fmt.Errorf("username taken")
+	}
+
 	s.nextUserID++
 	id := s.nextUserID
-	seqNum := s.allocateSeqNumber()
+	seq := s.allocateSeqLocked()
+	s.prepareAck(seq)
 
-	// sestavimo novega userja
-	user := &pb.User{
-		Id:             id,
-		Name:           request.GetName(),
-		SequenceNumber: seqNum,
-		Committed:      false,
+	user := &pb.User{Id: id, Name: name, SequenceNumber: seq, Committed: false}
+	entry := &pb.LogEntry{
+		SequenceNumber: seq,
+		RequestId:      rid,
+		Op:             pb.OpType_OP_CREATE_USER,
+		User:           user,
 	}
 
-	// shranimo v bazo
-	s.users[id] = user
-	s.lock.Unlock()
-
-	// prepare ack channel before propagation
-	s.prepareAck(seqNum)
-
-	// posredujemo naprej v verigo
-	if err := s.propagateCreateUser(ctx, user); err != nil {
+	if err := s.applyEntryLocked(entry); err != nil {
+		s.lock.Unlock()
 		return nil, err
 	}
 
-	// wait for acknowledgment from tail
-	if s.waitForAck(seqNum) {
-		user.Committed = true
-	} else {
-		return nil, fmt.Errorf("timeout waiting for acknowledgment from tail")
+	s.lock.Unlock()
+
+	if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
+		return nil, err
 	}
-
-	return user, nil
-}
-
-// CreateTopic ustvari novo temo in ji dodeli ID.
-// Write operacije so dovoljene samo na head vozlišču.
-func (s *messageBoardServer) CreateTopic(ctx context.Context, request *pb.CreateTopicRequest) (*pb.Topic, error) {
-	// samo head lahko sprejema write operacije
-	if !s.isHead() {
-		return nil, fmt.Errorf("write operations only allowed at head node")
-	}
-
-	if request.GetName() == "" {
-		return nil, fmt.Errorf("topic name not valid")
+	if !s.waitAck(seq, 5*time.Second) {
+		return nil, fmt.Errorf("timeout waiting for ack")
 	}
 
 	s.lock.Lock()
+	s.noteAck(seq)
+	resp := s.users[id]
+	s.lock.Unlock()
+	return resp, nil
+}
+
+func (s *messageBoardServer) CreateTopic(ctx context.Context, request *pb.CreateTopicRequest) (*pb.Topic, error) {
+	if !s.isHead() {
+		return nil, fmt.Errorf("write operations only allowed at head node")
+	}
+	if err := s.requireHeadReady(); err != nil {
+		return nil, err
+	}
+	name := strings.TrimSpace(request.GetName())
+	if name == "" {
+		return nil, fmt.Errorf("topic name not valid")
+	}
+	rid := strings.TrimSpace(request.GetRequestId())
+	if rid == "" {
+		return nil, fmt.Errorf("request_id required")
+	}
+
+	s.lock.Lock()
+	if entry, ok := s.getEntryByRequestIDLocked(rid); ok {
+		t := entry.GetTopic()
+		if t == nil {
+			s.lock.Unlock()
+			return nil, fmt.Errorf("stored entry missing topic")
+		}
+		resp := s.topics[t.GetId()]
+		s.lock.Unlock()
+		return resp, nil
+	}
 
 	s.nextTopicID++
 	id := s.nextTopicID
-	seqNum := s.allocateSeqNumber()
+	seq := s.allocateSeqLocked()
+	s.prepareAck(seq)
 
-	topic := &pb.Topic{
-		Id:             id,
-		Name:           request.GetName(),
-		SequenceNumber: seqNum,
-		Committed:      false,
+	topic := &pb.Topic{Id: id, Name: name, SequenceNumber: seq, Committed: false}
+	entry := &pb.LogEntry{
+		SequenceNumber: seq,
+		RequestId:      rid,
+		Op:             pb.OpType_OP_CREATE_TOPIC,
+		Topic:          topic,
 	}
 
-	s.topics[id] = topic
-
-	// za vsak nov topic pripravimo mapo za sporočila
-	if _, ok := s.messages[id]; !ok {
-		s.messages[id] = make(map[int64]*pb.Message)
-	}
-
-	if _, ok := s.nextMessageID[id]; !ok {
-		s.nextMessageID[id] = 0
-	}
-
-	if _, ok := s.postEvents[id]; !ok {
-		s.postEvents[id] = make(map[int64]*pb.MessageEvent)
+	if err := s.applyEntryLocked(entry); err != nil {
+		s.lock.Unlock()
+		return nil, err
 	}
 
 	s.lock.Unlock()
 
-	// prepare ack channel before propagation
-	s.prepareAck(seqNum)
-
-	// posredujemo naprej v verigo
-	if err := s.propagateCreateTopic(ctx, topic); err != nil {
+	if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
 		return nil, err
 	}
-
-	// wait for acknowledgment from tail
-	if s.waitForAck(seqNum) {
-		topic.Committed = true
-	} else {
-		return nil, fmt.Errorf("timeout waiting for acknowledgment from tail")
-	}
-
-	return topic, nil
-}
-
-// ListTopics vrne vse teme.
-// Read operacije servira samo tail vozlišče.
-func (s *messageBoardServer) ListTopics(ctx context.Context, _ *emptypb.Empty) (*pb.ListTopicsResponse, error) { //context.context nujen del rpc metode
-	s.lock.RLock()         // samo beremo - RLock
-	defer s.lock.RUnlock() // sprostimo lock na koncu
-
-	// samo tail lahko streže read operacije
-	if !s.isTail() {
-		return nil, fmt.Errorf("read operations only allowed at tail node")
-	}
-
-	response := &pb.ListTopicsResponse{
-		Topics: make([]*pb.Topic, 0, len(s.topics)),
-	}
-
-	for _, topic := range s.topics {
-		response.Topics = append(response.Topics, topic)
-	}
-
-	return response, nil
-}
-
-// PostMessage doda novo sporočilo v temo.
-// Uspe le, če user in topic obstajata.
-// Write operacije so dovoljene samo na head vozlišču.
-func (s *messageBoardServer) PostMessage(ctx context.Context, request *pb.PostMessageRequest) (*pb.Message, error) {
-
-	// samo head lahko sprejema write operacije
-	if !s.isHead() {
-		return nil, fmt.Errorf("write operations only allowed at head node")
-	}
-
-	if request.GetText() == "" {
-		return nil, fmt.Errorf("message text not valid")
+	if !s.waitAck(seq, 5*time.Second) {
+		return nil, fmt.Errorf("timeout waiting for ack")
 	}
 
 	s.lock.Lock()
+	s.noteAck(seq)
+	resp := s.topics[id]
+	s.lock.Unlock()
+	return resp, nil
+}
 
-	//preverimo, da user obstaja
+func (s *messageBoardServer) PostMessage(ctx context.Context, request *pb.PostMessageRequest) (*pb.Message, error) {
+	if !s.isHead() {
+		return nil, fmt.Errorf("write operations only allowed at head node")
+	}
+	if err := s.requireHeadReady(); err != nil {
+		return nil, err
+	}
+	text := strings.TrimSpace(request.GetText())
+	if text == "" {
+		return nil, fmt.Errorf("message text not valid")
+	}
+	rid := strings.TrimSpace(request.GetRequestId())
+	if rid == "" {
+		return nil, fmt.Errorf("request_id required")
+	}
+
+	s.lock.Lock()
+	if entry, ok := s.getEntryByRequestIDLocked(rid); ok {
+		m := entry.GetMessage()
+		if m == nil {
+			s.lock.Unlock()
+			return nil, fmt.Errorf("stored entry missing message")
+		}
+
+		// Prefer current state if present, otherwise return snapshot from log entry.
+		if tm, ok := s.messages[m.GetTopicId()]; ok {
+			if resp, ok := tm[m.GetId()]; ok {
+				s.lock.Unlock()
+				return resp, nil
+			}
+		}
+
+		s.lock.Unlock()
+		return m, nil
+	}
+
 	if _, ok := s.users[request.GetUserId()]; !ok {
 		s.lock.Unlock()
 		return nil, fmt.Errorf("user %d does not exist", request.GetUserId())
 	}
-
-	//preverimo, da topic obstaja
 	if _, ok := s.topics[request.GetTopicId()]; !ok {
 		s.lock.Unlock()
 		return nil, fmt.Errorf("topic %d does not exist", request.GetTopicId())
 	}
-
-	//topic mora imeti mapo za sporočila
-	if _, ok := s.messages[request.GetTopicId()]; !ok {
-		s.messages[request.GetTopicId()] = make(map[int64]*pb.Message)
-	}
-
-	//pridobimo topic, da povečamo števec sporočila za specifičen topic
 	topicID := request.GetTopicId()
-
-	//nov ID
+	if _, ok := s.messages[topicID]; !ok {
+		s.messages[topicID] = make(map[int64]*pb.Message)
+	}
 	s.nextMessageID[topicID]++
-	id := s.nextMessageID[topicID]
-	seqNum := s.allocateSeqNumber()
+	msgID := s.nextMessageID[topicID]
+	seq := s.allocateSeqLocked()
+	s.prepareAck(seq)
 
-	message := &pb.Message{
-		Id:             id,
-		TopicId:        request.GetTopicId(),
+	msg := &pb.Message{
+		Id:             msgID,
+		TopicId:        topicID,
 		UserId:         request.GetUserId(),
-		Text:           request.GetText(),
+		Text:           text,
 		CreatedAt:      timestamppb.Now(),
 		Likes:          0,
-		SequenceNumber: seqNum,
+		SequenceNumber: seq,
 		Committed:      false,
 	}
 
-	// shranimo v bazo
-	s.messages[topicID][id] = message
-
-	event := s.newMessageEvent(pb.OpType_OP_POST, message) //kreiramo event za broadcast naročnino
-
-	// shranimo originalni POST event za backlog
-	if _, ok := s.postEvents[topicID]; !ok {
-		s.postEvents[topicID] = make(map[int64]*pb.MessageEvent)
+	entry := &pb.LogEntry{
+		SequenceNumber: seq,
+		RequestId:      rid,
+		Op:             pb.OpType_OP_POST,
+		Message:        msg,
 	}
-	s.postEvents[topicID][id] = event
 
-	s.broadcastEvent(event) //sprotni broadcast vsem naročnikom
-
-	s.lock.Unlock()
-
-	// prepare ack channel before propagation
-	s.prepareAck(seqNum)
-
-	// posredujemo naprej v verigo
-	if err := s.propagateToSuccessor(ctx, pb.OpType_OP_POST, message); err != nil {
+	if err := s.applyEntryLocked(entry); err != nil {
+		s.lock.Unlock()
 		return nil, err
 	}
 
-	// wait for acknowledgment from tail
-	if s.waitForAck(seqNum) {
-		message.Committed = true
-	} else {
-		return nil, fmt.Errorf("timeout waiting for acknowledgment from tail")
+	s.lock.Unlock()
+
+	if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
+		return nil, err
+	}
+	if !s.waitAck(seq, 5*time.Second) {
+		return nil, fmt.Errorf("timeout waiting for ack")
 	}
 
-	return message, nil
+	s.lock.Lock()
+	s.noteAck(seq)
+	resp := s.messages[topicID][msgID]
+	s.lock.Unlock()
+	return resp, nil
 }
 
-// GetMessages vrne sporočila znotraj določene teme, urejena po ID-ju naraščajoče.
-// from_message_id = 0 pomeni "od začetka"
-// limit določa maksimalno število sporočil (0 = brez omejitve).
-// Read operacije so dovoljene samo na tail vozlišču.
-func (s *messageBoardServer) GetMessages(ctx context.Context, request *pb.GetMessagesRequest) (*pb.GetMessagesResponse, error) {
-	s.lock.RLock()
-	defer s.lock.RUnlock()
+func (s *messageBoardServer) UpdateMessage(ctx context.Context, request *pb.UpdateMessageRequest) (*pb.Message, error) {
+	if !s.isHead() {
+		return nil, fmt.Errorf("write operations only allowed at head node")
+	}
+	if err := s.requireHeadReady(); err != nil {
+		return nil, err
+	}
+	rid := strings.TrimSpace(request.GetRequestId())
+	if rid == "" {
+		return nil, fmt.Errorf("request_id required")
+	}
+	newText := strings.TrimSpace(request.GetText())
+	if newText == "" {
+		return nil, fmt.Errorf("text not valid")
+	}
 
-	// samo tail lahko streže read operacije
+	s.lock.Lock()
+	if entry, ok := s.getEntryByRequestIDLocked(rid); ok {
+		m := entry.GetMessage()
+		if m == nil {
+			s.lock.Unlock()
+			return nil, fmt.Errorf("stored entry missing message")
+		}
+
+		// Prefer current state if present, otherwise return snapshot from log entry.
+		if tm, ok := s.messages[m.GetTopicId()]; ok {
+			if resp, ok := tm[m.GetId()]; ok {
+				s.lock.Unlock()
+				return resp, nil
+			}
+		}
+
+		s.lock.Unlock()
+		return m, nil
+	}
+
+	if _, ok := s.users[request.GetUserId()]; !ok {
+		s.lock.Unlock()
+		return nil, fmt.Errorf("user %d does not exist", request.GetUserId())
+	}
+	tm, ok := s.messages[request.GetTopicId()]
+	if !ok {
+		s.lock.Unlock()
+		return nil, fmt.Errorf("topic %d does not exist", request.GetTopicId())
+	}
+	ex, ok := tm[request.GetMessageId()]
+	if !ok {
+		s.lock.Unlock()
+		return nil, fmt.Errorf("message %d does not exist", request.GetMessageId())
+	}
+	if ex.UserId != request.GetUserId() {
+		s.lock.Unlock()
+		return nil, fmt.Errorf("user %d is not the author of message %d", request.GetUserId(), request.GetMessageId())
+	}
+
+	seq := s.allocateSeqLocked()
+	s.prepareAck(seq)
+
+	snapshot := &pb.Message{
+		Id:             ex.GetId(),
+		TopicId:        ex.GetTopicId(),
+		UserId:         ex.GetUserId(),
+		Text:           newText,
+		CreatedAt:      ex.GetCreatedAt(),
+		Likes:          ex.GetLikes(),
+		SequenceNumber: seq,
+		Committed:      false,
+	}
+
+	entry := &pb.LogEntry{
+		SequenceNumber: seq,
+		RequestId:      rid,
+		Op:             pb.OpType_OP_UPDATE,
+		Message:        snapshot,
+	}
+
+	if err := s.applyEntryLocked(entry); err != nil {
+		s.lock.Unlock()
+		return nil, err
+	}
+
+	s.lock.Unlock()
+
+	if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
+		return nil, err
+	}
+	if !s.waitAck(seq, 5*time.Second) {
+		return nil, fmt.Errorf("timeout waiting for ack")
+	}
+
+	s.lock.Lock()
+	s.noteAck(seq)
+	resp := s.messages[request.GetTopicId()][request.GetMessageId()]
+	s.lock.Unlock()
+	return resp, nil
+}
+
+func (s *messageBoardServer) DeleteMessage(ctx context.Context, request *pb.DeleteMessageRequest) (*emptypb.Empty, error) {
+	if !s.isHead() {
+		return nil, fmt.Errorf("write operations only allowed at head node")
+	}
+	if err := s.requireHeadReady(); err != nil {
+		return nil, err
+	}
+	rid := strings.TrimSpace(request.GetRequestId())
+	if rid == "" {
+		return nil, fmt.Errorf("request_id required")
+	}
+
+	s.lock.Lock()
+	if _, ok := s.getEntryByRequestIDLocked(rid); ok {
+		s.lock.Unlock()
+		return &emptypb.Empty{}, nil
+	}
+
+	if _, ok := s.users[request.GetUserId()]; !ok {
+		s.lock.Unlock()
+		return nil, fmt.Errorf("user %d does not exist", request.GetUserId())
+	}
+	tm, ok := s.messages[request.GetTopicId()]
+	if !ok {
+		s.lock.Unlock()
+		return nil, fmt.Errorf("topic %d does not exist", request.GetTopicId())
+	}
+	ex, ok := tm[request.GetMessageId()]
+	if !ok {
+		s.lock.Unlock()
+		return nil, fmt.Errorf("message %d does not exist", request.GetMessageId())
+	}
+	if ex.UserId != request.GetUserId() {
+		s.lock.Unlock()
+		return nil, fmt.Errorf("user %d is not the author of message %d", request.GetUserId(), request.GetMessageId())
+	}
+
+	seq := s.allocateSeqLocked()
+	s.prepareAck(seq)
+
+	snapshot := &pb.Message{
+		Id:             ex.GetId(),
+		TopicId:        ex.GetTopicId(),
+		UserId:         ex.GetUserId(),
+		Text:           ex.GetText(),
+		CreatedAt:      ex.GetCreatedAt(),
+		Likes:          ex.GetLikes(),
+		SequenceNumber: seq,
+		Committed:      false,
+	}
+	entry := &pb.LogEntry{
+		SequenceNumber: seq,
+		RequestId:      rid,
+		Op:             pb.OpType_OP_DELETE,
+		Message:        snapshot,
+	}
+
+	if err := s.applyEntryLocked(entry); err != nil {
+		s.lock.Unlock()
+		return nil, err
+	}
+
+	s.lock.Unlock()
+
+	if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
+		return nil, err
+	}
+	if !s.waitAck(seq, 5*time.Second) {
+		return nil, fmt.Errorf("timeout waiting for ack")
+	}
+
+	s.lock.Lock()
+	s.noteAck(seq)
+	s.lock.Unlock()
+	return &emptypb.Empty{}, nil
+}
+
+func (s *messageBoardServer) LikeMessage(ctx context.Context, request *pb.LikeMessageRequest) (*pb.Message, error) {
+	if !s.isHead() {
+		return nil, fmt.Errorf("write operations only allowed at head node")
+	}
+	if err := s.requireHeadReady(); err != nil {
+		return nil, err
+	}
+	rid := strings.TrimSpace(request.GetRequestId())
+	if rid == "" {
+		return nil, fmt.Errorf("request_id required")
+	}
+
+	s.lock.Lock()
+	if entry, ok := s.getEntryByRequestIDLocked(rid); ok {
+		m := entry.GetMessage()
+		if m == nil {
+			s.lock.Unlock()
+			return nil, fmt.Errorf("stored entry missing message")
+		}
+
+		// Prefer current state if present, otherwise return snapshot from log entry.
+		if tm, ok := s.messages[m.GetTopicId()]; ok {
+			if resp, ok := tm[m.GetId()]; ok {
+				s.lock.Unlock()
+				return resp, nil
+			}
+		}
+
+		s.lock.Unlock()
+		return m, nil
+	}
+
+	if _, ok := s.users[request.GetUserId()]; !ok {
+		s.lock.Unlock()
+		return nil, fmt.Errorf("user %d does not exist", request.GetUserId())
+	}
+	tm, ok := s.messages[request.GetTopicId()]
+	if !ok {
+		s.lock.Unlock()
+		return nil, fmt.Errorf("topic %d does not exist", request.GetTopicId())
+	}
+	ex, ok := tm[request.GetMessageId()]
+	if !ok {
+		s.lock.Unlock()
+		return nil, fmt.Errorf("message %d does not exist", request.GetMessageId())
+	}
+
+	seq := s.allocateSeqLocked()
+	s.prepareAck(seq)
+
+	snapshot := &pb.Message{
+		Id:             ex.GetId(),
+		TopicId:        ex.GetTopicId(),
+		UserId:         ex.GetUserId(),
+		Text:           ex.GetText(),
+		CreatedAt:      ex.GetCreatedAt(),
+		Likes:          ex.GetLikes(),
+		SequenceNumber: seq,
+		Committed:      false,
+	}
+	entry := &pb.LogEntry{
+		SequenceNumber: seq,
+		RequestId:      rid,
+		Op:             pb.OpType_OP_LIKE,
+		Message:        snapshot,
+	}
+
+	if err := s.applyEntryLocked(entry); err != nil {
+		s.lock.Unlock()
+		return nil, err
+	}
+
+	s.lock.Unlock()
+
+	if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
+		return nil, err
+	}
+	if !s.waitAck(seq, 5*time.Second) {
+		return nil, fmt.Errorf("timeout waiting for ack")
+	}
+
+	s.lock.Lock()
+	s.noteAck(seq)
+	resp := s.messages[request.GetTopicId()][request.GetMessageId()]
+	s.lock.Unlock()
+	return resp, nil
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Reads (tail only)
+////////////////////////////////////////////////////////////////////////////////
+
+func (s *messageBoardServer) ListTopics(ctx context.Context, _ *emptypb.Empty) (*pb.ListTopicsResponse, error) {
 	if !s.isTail() {
 		return nil, fmt.Errorf("read operations only allowed at tail node")
 	}
+	s.lock.RLock()
+	defer s.lock.RUnlock()
 
-	// preverimo, če tema obstaja
-	tMessages, ok := s.messages[request.GetTopicId()]
+	out := &pb.ListTopicsResponse{Topics: make([]*pb.Topic, 0, len(s.topics))}
+	for _, t := range s.topics {
+		if t.Committed {
+			out.Topics = append(out.Topics, t)
+		}
+	}
+	sort.Slice(out.Topics, func(i, j int) bool { return out.Topics[i].Id < out.Topics[j].Id })
+	return out, nil
+}
+
+func (s *messageBoardServer) GetMessages(ctx context.Context, request *pb.GetMessagesRequest) (*pb.GetMessagesResponse, error) {
+	if !s.isTail() {
+		return nil, fmt.Errorf("read operations only allowed at tail node")
+	}
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+
+	tm, ok := s.messages[request.GetTopicId()]
 	if !ok {
 		return nil, fmt.Errorf("topic %d does not exist", request.GetTopicId())
 	}
@@ -469,527 +1317,157 @@ func (s *messageBoardServer) GetMessages(ctx context.Context, request *pb.GetMes
 	fromID := request.GetFromMessageId()
 	limit := request.GetLimit()
 
-	//zberemo vse ID-je sporočil
-	messagesID := make([]int64, 0, len(tMessages))
-	for messageID := range tMessages {
-		if messageID < fromID {
+	ids := make([]int64, 0, len(tm))
+	for id, msg := range tm {
+		if id < fromID {
 			continue
 		}
-		messagesID = append(messagesID, messageID)
+		if !msg.Committed {
+			continue
+		}
+		ids = append(ids, id)
 	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 
-	//uredimo ID-je naraščajoče
-	sort.Slice(messagesID, func(i, j int) bool {
-		return messagesID[i] < messagesID[j]
-	})
-
-	response := &pb.GetMessagesResponse{
-		Messages: make([]*pb.Message, 0, len(messagesID)),
-	}
-
-	//dodamo sporočila v urejenem vrstnem redu in upoštevamo limit
-	for _, messageID := range messagesID {
-		response.Messages = append(response.Messages, tMessages[messageID])
-		if limit > 0 && int32(len(response.Messages)) >= limit {
+	out := &pb.GetMessagesResponse{Messages: make([]*pb.Message, 0, len(ids))}
+	for _, id := range ids {
+		out.Messages = append(out.Messages, tm[id])
+		if limit > 0 && int32(len(out.Messages)) >= limit {
 			break
 		}
 	}
-
-	return response, nil
+	return out, nil
 }
 
-// UpdateMessage posodobi obstoječe sporočilo.
-// Dovoli se samo uporabniku, ki je sporočilo napisal.
-// Write operacije so dovoljene samo na head vozlišču.
-func (s *messageBoardServer) UpdateMessage(ctx context.Context, request *pb.UpdateMessageRequest) (*pb.Message, error) {
-	// samo head lahko sprejema write operacije
-	if !s.isHead() {
-		return nil, fmt.Errorf("write operations only allowed at head node")
-	}
+////////////////////////////////////////////////////////////////////////////////
+// Subscription load balancing (head)
+////////////////////////////////////////////////////////////////////////////////
 
-	s.lock.Lock()
-
-	//preverimo, če user obstaja
-	if _, ok := s.users[request.GetUserId()]; !ok {
-		s.lock.Unlock()
-		return nil, fmt.Errorf("user %d does not exist", request.GetUserId())
-	}
-
-	//preverimo, če tema obstaja
-	tMessages, ok := s.messages[request.GetTopicId()]
-	if !ok {
-		s.lock.Unlock()
-		return nil, fmt.Errorf("topic %d does not exist", request.GetTopicId())
-	}
-
-	//preverimo, če sporočilo obstaja
-	message, ok := tMessages[request.GetMessageId()]
-	if !ok {
-		s.lock.Unlock()
-		return nil, fmt.Errorf("message %d does not exist", request.GetMessageId())
-	}
-
-	//preverimo, da je to sporočilo od ustreznega uporabnika
-	if message.UserId != request.GetUserId() {
-		s.lock.Unlock()
-		return nil, fmt.Errorf("user %d is not the author of message %d", request.GetUserId(), request.GetMessageId())
-	}
-
-	//posodobimo besedilo
-	seqNum := s.allocateSeqNumber()
-	message.Text = request.GetText()
-	message.SequenceNumber = seqNum
-	message.Committed = false
-
-	event := s.newMessageEvent(pb.OpType_OP_UPDATE, message)
-	s.broadcastEvent(event) //sprotni broadcast naročnikom
-
-	s.lock.Unlock()
-
-	// prepare ack channel before propagation
-	s.prepareAck(seqNum)
-
-	// posredujemo naprej v verigo
-	if err := s.propagateToSuccessor(ctx, pb.OpType_OP_UPDATE, message); err != nil {
-		return nil, err
-	}
-
-	// wait for acknowledgment from tail
-	if s.waitForAck(seqNum) {
-		message.Committed = true
-	} else {
-		return nil, fmt.Errorf("timeout waiting for acknowledgment from tail")
-	}
-
-	return message, nil
-}
-
-// DeleteMessage izbriše obstoječe sporočilo.
-// Dovoljeno samo avtorju sporočila.
-// Write operacije so dovoljene samo na head vozlišču.
-func (s *messageBoardServer) DeleteMessage(ctx context.Context, request *pb.DeleteMessageRequest) (*emptypb.Empty, error) {
-	// samo head lahko sprejema write operacije
-	if !s.isHead() {
-		return nil, fmt.Errorf("write operations only allowed at head node")
-	}
-
-	s.lock.Lock()
-
-	//preverimo, če user obstaja
-	if _, ok := s.users[request.GetUserId()]; !ok {
-		s.lock.Unlock()
-		return nil, fmt.Errorf("user %d does not exist", request.GetUserId())
-	}
-
-	// preverimo, če user obstaja
-	tMessages, ok := s.messages[request.GetTopicId()]
-	if !ok {
-		s.lock.Unlock()
-		return nil, fmt.Errorf("topic %d does not exist", request.GetTopicId())
-	}
-
-	//preverimo, če sporočilo obstaja
-	message, ok := tMessages[request.GetMessageId()]
-	if !ok {
-		s.lock.Unlock()
-		return nil, fmt.Errorf("message %d does not exist", request.GetMessageId())
-	}
-
-	//preverimo, da je to sporočilo od ustreznega uporabnika
-	if message.UserId != request.GetUserId() {
-		s.lock.Unlock()
-		return nil, fmt.Errorf("user %d is not the author of message %d", request.GetUserId(), request.GetMessageId())
-	}
-
-	// zabeležimo zaporedno številko za operacijo
-	seqNum := s.allocateSeqNumber()
-	message.SequenceNumber = seqNum
-
-	event := s.newMessageEvent(pb.OpType_OP_DELETE, message)
-
-	// izbrišemo sporočilo
-	delete(tMessages, request.GetMessageId())
-
-	s.broadcastEvent(event) //sprotni broadcast naročnikom
-
-	s.lock.Unlock()
-
-	// prepare ack channel before propagation
-	s.prepareAck(seqNum)
-
-	// posredujemo naprej v verigo
-	if err := s.propagateToSuccessor(ctx, pb.OpType_OP_DELETE, message); err != nil {
-		return nil, err
-	}
-
-	// wait for acknowledgment from tail
-	if !s.waitForAck(seqNum) {
-		return nil, fmt.Errorf("timeout waiting for acknowledgment from tail")
-	}
-
-	return &emptypb.Empty{}, nil
-}
-
-// LikeMessage poveča število všečkov na sporočilu.
-// Sporočilo lahko like-a katerikoli obstoječi uporabnik
-// Write operacije so dovoljene samo na head vozlišču.
-func (s *messageBoardServer) LikeMessage(ctx context.Context, request *pb.LikeMessageRequest) (*pb.Message, error) {
-	// samo head lahko sprejema write operacije
-	if !s.isHead() {
-		return nil, fmt.Errorf("write operations only allowed at head node")
-	}
-
-	s.lock.Lock()
-
-	// preverimo, da uporabnik obstaja, da lahko všečka
-	if _, ok := s.users[request.GetUserId()]; !ok {
-		s.lock.Unlock()
-		return nil, fmt.Errorf("user %d does not exist", request.GetUserId())
-	}
-
-	// preverimo, da tema obstaja
-	tMessages, ok := s.messages[request.GetTopicId()]
-	if !ok {
-		s.lock.Unlock()
-		return nil, fmt.Errorf("topic %d does not exist", request.GetTopicId())
-	}
-
-	// preverimo, da sporočilo obstaja
-	message, ok := tMessages[request.GetMessageId()]
-	if !ok {
-		s.lock.Unlock()
-		return nil, fmt.Errorf("message %d does not exist", request.GetMessageId())
-	}
-
-	// povečamo število všečkov
-	seqNum := s.allocateSeqNumber()
-	message.Likes++
-	message.SequenceNumber = seqNum
-	message.Committed = false
-
-	event := s.newMessageEvent(pb.OpType_OP_LIKE, message)
-	s.broadcastEvent(event) //sprotni broadcast naročnikom
-
-	s.lock.Unlock()
-
-	// prepare ack channel before propagation
-	s.prepareAck(seqNum)
-
-	// posredujemo naprej v verigo
-	if err := s.propagateToSuccessor(ctx, pb.OpType_OP_LIKE, message); err != nil {
-		return nil, err
-	}
-
-	// wait for acknowledgment from tail
-	if s.waitForAck(seqNum) {
-		message.Committed = true
-	} else {
-		return nil, fmt.Errorf("timeout waiting for acknowledgment from tail")
-	}
-
-	return message, nil
-}
-
-// isHead preverja, ali je to vozlišče glava verige
-func (s *messageBoardServer) isHead() bool {
-	s.lock.RLock()
-	defer s.lock.RUnlock()
-	return s.address == s.headAddress
-}
-
-// isTail preverja, ali je to vozlišče rep verige
-func (s *messageBoardServer) isTail() bool {
-	// s.lock.RLock()
-	// defer s.lock.RUnlock()
-	return s.address == s.tailAddress
-}
-
-// propagateToSuccessor posreduje operacijo naslednjemu vozlišču v verigi
-func (s *messageBoardServer) propagateToSuccessor(ctx context.Context, op pb.OpType, message *pb.Message) error {
-	s.lock.RLock()
-	successorClient := s.successorClient
-	s.lock.RUnlock()
-
-	if successorClient == nil {
-		// ni successorja, smo tail
-		return nil
-	}
-
-	// posredujemo operacijo naslednjemu vozlišču
-	switch op {
-	case pb.OpType_OP_POST:
-		req := &pb.PostMessageRequest{
-			UserId:         message.UserId,
-			TopicId:        message.TopicId,
-			Text:           message.Text,
-			MessageId:      message.Id, // posreduj ID, ki ga je generiral head
-			SequenceNumber: message.SequenceNumber,
-		}
-		_, err := successorClient.PropagatePost(ctx, req)
-		return err
-
-	case pb.OpType_OP_UPDATE:
-		req := &pb.UpdateMessageRequest{
-			UserId:         message.UserId,
-			TopicId:        message.TopicId,
-			MessageId:      message.Id,
-			Text:           message.Text,
-			SequenceNumber: message.SequenceNumber,
-		}
-		_, err := successorClient.PropagateUpdate(ctx, req)
-		return err
-
-	case pb.OpType_OP_DELETE:
-		req := &pb.DeleteMessageRequest{
-			UserId:         message.UserId,
-			TopicId:        message.TopicId,
-			MessageId:      message.Id,
-			SequenceNumber: message.SequenceNumber,
-		}
-		_, err := successorClient.PropagateDelete(ctx, req)
-		return err
-
-	case pb.OpType_OP_LIKE:
-		req := &pb.LikeMessageRequest{
-			UserId:         message.UserId,
-			TopicId:        message.TopicId,
-			MessageId:      message.Id,
-			SequenceNumber: message.SequenceNumber,
-		}
-		_, err := successorClient.PropagateLike(ctx, req)
-		return err
-	}
-
-	return nil
-}
-
-// propagateCreateUser posreduje CreateUser operacijo naslednjemu vozlišču
-func (s *messageBoardServer) propagateCreateUser(ctx context.Context, user *pb.User) error {
-	s.lock.RLock()
-	successorClient := s.successorClient
-	s.lock.RUnlock()
-
-	if successorClient == nil {
-		// ni successorja, smo tail
-		return nil
-	}
-
-	req := &pb.CreateUserRequest{
-		Name:           user.Name,
-		Id:             user.Id, // posreduj ID, ki ga je generiral head
-		SequenceNumber: user.SequenceNumber,
-	}
-	_, err := successorClient.PropagateCreateUser(ctx, req)
-	return err
-}
-
-// propagateCreateTopic posreduje CreateTopic operacijo naslednjemu vozlišču
-func (s *messageBoardServer) propagateCreateTopic(ctx context.Context, topic *pb.Topic) error {
-	s.lock.RLock()
-	successorClient := s.successorClient
-	s.lock.RUnlock()
-
-	if successorClient == nil {
-		// ni successorja, smo tail
-		return nil
-	}
-
-	req := &pb.CreateTopicRequest{
-		Name:           topic.Name,
-		Id:             topic.Id, // posreduj ID, ki ga je generiral head
-		SequenceNumber: topic.SequenceNumber,
-	}
-	_, err := successorClient.PropagateCreateTopic(ctx, req)
-	return err
-}
-
-// gre za nadzorno ravnino, ki spremlja katera vozlišča so head in tail
-func (s *messageBoardServer) GetClusterState(ctx context.Context, _ *emptypb.Empty) (*pb.GetClusterStateResponse, error) {
-	s.lock.RLock()
-	defer s.lock.RUnlock()
-
-	var head, tail *pb.NodeInfo
-
-	if len(s.chain) > 0 {
-		head = s.chain[0]
-		tail = s.chain[len(s.chain)-1]
-	} else {
-		// če ni verige, vrnemo samo ta node
-		node := &pb.NodeInfo{
-			NodeId:  s.nodeID,
-			Address: s.address,
-		}
-		head = node
-		tail = node
-	}
-
-	return &pb.GetClusterStateResponse{
-		Head: head,
-		Tail: tail,
-	}, nil
-}
-
-// GetSubscriptionNode vrne node, na katerega naj se klient naroči in generira subscribe_token, ki ga bo kasneje preveril SubscribeTopic.
-// Izvaja load balancing tako, da izbere vozlišče z najmanj naročninami.
 func (s *messageBoardServer) GetSubscriptionNode(ctx context.Context, request *pb.SubscriptionNodeRequest) (*pb.SubscriptionNodeResponse, error) {
-	s.lock.Lock()
-
-	// preverimo, da user obstaja
-	if _, ok := s.users[request.GetUserId()]; !ok {
-		s.lock.Unlock()
-		return nil, fmt.Errorf("user %d does not exist", request.GetUserId())
+	if !s.isHead() {
+		return nil, fmt.Errorf("subscription routing only allowed at head node")
+	}
+	if err := s.requireHeadReady(); err != nil {
+		return nil, err
 	}
 
-	// generiramo in shranimo token lokalno
-	token := s.newSubscribeToken(request.GetUserId(), request.GetTopicId())
+	s.lock.RLock()
+	controlAddr := s.controlAddr
+	s.lock.RUnlock()
 
-	// izberi vozlišče z najmanj naročninami za load balancing
-	var selectedNode *pb.NodeInfo
-	var minCount int64 = -1
-
-	if len(s.chain) > 0 {
-		// iteriramo skozi vso verigo in poiščemo vozlišče z najmanj naročninami
-		for _, node := range s.chain {
-			count := s.nodeSubscriptionCount[node.GetNodeId()]
-			if minCount == -1 || count < minCount {
-				minCount = count
-				selectedNode = node
-			}
-		}
-		// povečamo števec za izbrano vozlišče
-		if selectedNode != nil {
-			s.nodeSubscriptionCount[selectedNode.GetNodeId()]++
-		}
-	} else {
-		// če ni verige, vrnemo samo ta node
-		selectedNode = &pb.NodeInfo{
-			NodeId:  s.nodeID,
-			Address: s.address,
-		}
-		s.nodeSubscriptionCount[s.nodeID]++
+	if strings.TrimSpace(controlAddr) == "" {
+		return nil, fmt.Errorf("control plane address not set")
 	}
 
-	s.lock.Unlock()
+	conn, err := grpc.NewClient(controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, fmt.Errorf("failed to dial control plane: %v", err)
+	}
+	defer conn.Close()
 
-	// če je izbrano vozlišče različno od trenutnega, propagirajmo token
-	if selectedNode.GetNodeId() != s.nodeID {
-		conn, err := grpc.NewClient(selectedNode.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			return nil, fmt.Errorf("failed to connect to selected node: %v", err)
-		}
-		defer conn.Close()
+	cpClient := pb.NewControlPlaneClient(conn)
+	cpCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel()
 
-		client := pb.NewMessageBoardClient(conn)
-		_, err = client.PropagateToken(ctx, &pb.TokenPropagationRequest{
-			Token:   token,
-			UserId:  request.GetUserId(),
-			TopicId: request.GetTopicId(),
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to propagate token: %v", err)
-		}
+	node, err := cpClient.GetLeastLoadedNode(cpCtx, &emptypb.Empty{})
+	if err != nil || node == nil || node.GetAddress() == "" {
+		// fallback: head sam
+		node = &pb.NodeInfo{NodeId: s.nodeID, Address: s.address}
+	}
+
+	// token še vedno podpiše head
+	token, err := s.makeSubscribeToken(request.GetUserId(), request.GetTopicId(), time.Now().Add(10*time.Minute).Unix())
+	if err != nil {
+		return nil, err
 	}
 
 	return &pb.SubscriptionNodeResponse{
 		SubscribeToken: token,
-		Node:           selectedNode,
+		Node:           node,
 	}, nil
 }
 
-// SubscribeTopic odpre stream dogodkov za izbrane topice.
-// Uporabi subscribe_token, ki ga je prej vrnil GetSubscriptionNode.
 func (s *messageBoardServer) SubscribeTopic(request *pb.SubscribeTopicRequest, stream pb.MessageBoard_SubscribeTopicServer) error {
-	//preverimo token in pripravimo subscription pod Lockom
-	s.lock.Lock()
-
-	tokenInfo, ok := s.tokens[request.GetSubscribeToken()]
-	if !ok || tokenInfo.UserID != request.GetUserId() {
-		s.lock.Unlock()
-		return fmt.Errorf("subscribe token not valid")
+	// validate token (works on any node)
+	topicsFromToken, err := s.validateSubscribeToken(request.GetSubscribeToken(), request.GetUserId())
+	if err != nil {
+		return err
 	}
 
-	// če client ne navede topicov, uporabimo tiste iz tokena
-	topicsID := request.GetTopicId()
-	if len(topicsID) == 0 {
-		topicsID = tokenInfo.Topics
-	}
+	topics := topicsFromToken
 
-	topicsSet := make(map[int64]struct{})
-	for _, t := range topicsID {
+	topicsSet := make(map[int64]struct{}, len(topics))
+	for _, t := range topics {
 		topicsSet[t] = struct{}{}
 	}
 
-	// ustvarimo subscription
+	s.lock.Lock()
 	s.nextSubID++
 	subID := s.nextSubID
-
 	sub := &subscription{
-		id:      subID,
-		userID:  request.GetUserId(),
 		topics:  topicsSet,
-		channel: make(chan *pb.MessageEvent, 16),
+		channel: make(chan *pb.MessageEvent, 64),
+		nodeID:  s.nodeID,
 	}
+	s.subCount.Add(1)
 	s.subscribers[subID] = sub
 
-	// pripravimo backlog sporočil od from_message_id naprej, deluje kot nekakšen sync za vsa prejšnja sporočila, ko še ni bil naročen
 	fromID := request.GetFromMessageId()
 	backlog := make([]*pb.MessageEvent, 0)
 
 	for topicID := range topicsSet {
-		tMessages, ok := s.messages[topicID]
+		tm, ok := s.messages[topicID]
 		if !ok {
 			continue
 		}
-
-		// zberemo ID-je in jih uredimo
-		messages := make([]int64, 0, len(tMessages))
-		for message := range tMessages {
-			if message < fromID {
+		ids := make([]int64, 0, len(tm))
+		for msgID, msg := range tm {
+			if msgID < fromID {
 				continue
 			}
-			messages = append(messages, message)
+			if !msg.Committed {
+				continue
+			}
+			ids = append(ids, msgID)
 		}
-		sort.Slice(messages, func(i, j int) bool {
-			return messages[i] < messages[j]
-		})
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 
-		//backlog je sestavljen iz sporočil, ki smo si jih shranili v mapo
-		postEvMap, ok := s.postEvents[topicID]
+		evMap, ok := s.postEvents[topicID]
 		if !ok {
 			continue
 		}
-
-		for _, messageID := range messages {
-			if ev, ok := postEvMap[messageID]; ok {
+		for _, msgID := range ids {
+			if ev, ok := evMap[msgID]; ok {
 				backlog = append(backlog, ev)
 			}
 		}
-
 	}
-
 	s.lock.Unlock()
 
-	//najprej pošljemo backlog
-	for _, event := range backlog {
-		if err := stream.Send(event); err != nil {
+	for _, ev := range backlog {
+		if err := stream.Send(ev); err != nil {
 			s.removeSubscription(subID)
 			return err
 		}
 	}
 
-	//nato v zanki pošiljamo nove evente iz sub.ch
 	for {
 		select {
 		case <-stream.Context().Done():
-			// klient se je odklopil
 			s.removeSubscription(subID)
 			return nil
-		case event, ok := <-sub.channel:
+		case ev, ok := <-sub.channel:
 			if !ok {
-				// kanal zaprt
+				s.removeSubscription(subID)
 				return nil
 			}
-			if err := stream.Send(event); err != nil {
+			s.lock.RLock()
+			committed := ev.GetSequenceNumber() <= s.lastCommittedSeq
+			s.lock.RUnlock()
+			if !committed {
+				continue
+			}
+			if err := stream.Send(ev); err != nil {
 				s.removeSubscription(subID)
 				return err
 			}
@@ -997,755 +1475,173 @@ func (s *messageBoardServer) SubscribeTopic(request *pb.SubscribeTopicRequest, s
 	}
 }
 
-// PropagatePost prejme POST operacijo od predecessor vozlišča in jo posreduje naprej
-func (s *messageBoardServer) PropagatePost(ctx context.Context, request *pb.PostMessageRequest) (*pb.Message, error) {
+////////////////////////////////////////////////////////////////////////////////
+// Internal chain RPCs
+////////////////////////////////////////////////////////////////////////////////
+
+func (s *messageBoardServer) PropagateEntry(ctx context.Context, entry *pb.LogEntry) (*emptypb.Empty, error) {
+	if err := s.requireNodeReady(); err != nil {
+		return nil, err
+	}
 	s.lock.Lock()
-
-	// preverimo, da user obstaja
-	if _, ok := s.users[request.GetUserId()]; !ok {
-		s.lock.Unlock()
-		return nil, fmt.Errorf("user %d does not exist", request.GetUserId())
-	}
-
-	// preverimo, da topic obstaja
-	if _, ok := s.topics[request.GetTopicId()]; !ok {
-		s.lock.Unlock()
-		return nil, fmt.Errorf("topic %d does not exist", request.GetTopicId())
-	}
-
-	// topic mora imeti mapo za sporočila
-	if _, ok := s.messages[request.GetTopicId()]; !ok {
-		s.messages[request.GetTopicId()] = make(map[int64]*pb.Message)
-	}
-
-	topicID := request.GetTopicId()
-
-	// uporabimo ID, ki ga je določil head (poslan v requestu), namesto da ustvarjamo novega
-	id := request.GetMessageId()
-	if id == 0 {
-		// generiraj ID, če ni podan (naj se ne bi zgodilo)
-		s.nextMessageID[topicID]++
-		id = s.nextMessageID[topicID]
-	} else {
-		// posodobi števec ID-jev, da ustreza prejetemu ID-ju (od heada)
-		if id > s.nextMessageID[topicID] {
-			s.nextMessageID[topicID] = id
-		}
-	}
-
-	seqNum := request.GetSequenceNumber()
-
-	// Validate sequence number to ensure operations arrive in order
-	if err := s.validateSequenceNumber(seqNum); err != nil {
+	if err := s.applyEntryLocked(entry); err != nil {
 		s.lock.Unlock()
 		return nil, err
 	}
-
-	message := &pb.Message{
-		Id:             id,
-		TopicId:        request.GetTopicId(),
-		UserId:         request.GetUserId(),
-		Text:           request.GetText(),
-		CreatedAt:      timestamppb.Now(),
-		Likes:          0,
-		SequenceNumber: seqNum,
-		Committed:      false,
-	}
-
-	// shranimo v bazo
-	s.messages[topicID][id] = message
-
-	event := s.newMessageEvent(pb.OpType_OP_POST, message)
-
-	// shranimo originalni POST event za backlog
-	if _, ok := s.postEvents[topicID]; !ok {
-		s.postEvents[topicID] = make(map[int64]*pb.MessageEvent)
-	}
-	s.postEvents[topicID][id] = event
-
-	s.broadcastEvent(event)
-
-	isTail := s.isTail()
-	pred := s.predecessor
-
+	isTail := s.address == s.tailAddress
+	hasSucc := s.successorClient != nil
 	s.lock.Unlock()
 
-	// posredujemo naprej v verigo
-	if err := s.propagateToSuccessor(ctx, pb.OpType_OP_POST, message); err != nil {
-		return nil, err
-	}
-
-	// if we are tail, send acknowledgment back
-	if isTail && pred != nil {
-		conn, err := grpc.NewClient(pred.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err == nil {
-			defer conn.Close()
-			client := pb.NewMessageBoardClient(conn)
-			ackReq := &pb.AckRequest{
-				SequenceNumber: seqNum,
-				OpType:         pb.OpType_OP_POST,
-				EntityId:       id,
-				TopicId:        topicID,
-			}
-			_, _ = client.AckPost(ctx, ackReq)
-		}
-	}
-
-	return message, nil
-}
-
-// PropagateUpdate prejme UPDATE operacijo od predecessor vozlišča
-func (s *messageBoardServer) PropagateUpdate(ctx context.Context, request *pb.UpdateMessageRequest) (*pb.Message, error) {
-	s.lock.Lock()
-
-	// preverimo, če user obstaja
-	if _, ok := s.users[request.GetUserId()]; !ok {
-		s.lock.Unlock()
-		return nil, fmt.Errorf("user %d does not exist", request.GetUserId())
-	}
-
-	// preverimo, če tema obstaja
-	tMessages, ok := s.messages[request.GetTopicId()]
-	if !ok {
-		s.lock.Unlock()
-		return nil, fmt.Errorf("topic %d does not exist", request.GetTopicId())
-	}
-
-	// preverimo, če sporočilo obstaja
-	message, ok := tMessages[request.GetMessageId()]
-	if !ok {
-		s.lock.Unlock()
-		return nil, fmt.Errorf("message %d does not exist", request.GetMessageId())
-	}
-
-	// preverimo, da je to sporočilo od ustreznega uporabnika
-	if message.UserId != request.GetUserId() {
-		s.lock.Unlock()
-		return nil, fmt.Errorf("user %d is not the author of message %d", request.GetUserId(), request.GetMessageId())
-	}
-
-	// posodobimo besedilo
-	seqNum := request.GetSequenceNumber()
-
-	// Validate sequence number to ensure operations arrive in order
-	if err := s.validateSequenceNumber(seqNum); err != nil {
-		s.lock.Unlock()
-		return nil, err
-	}
-
-	message.Text = request.GetText()
-	message.SequenceNumber = seqNum
-	message.Committed = false
-
-	event := s.newMessageEvent(pb.OpType_OP_UPDATE, message)
-	s.broadcastEvent(event)
-
-	isTail := s.isTail()
-	pred := s.predecessor
-	topicID := request.GetTopicId()
-	messageID := request.GetMessageId()
-
-	s.lock.Unlock()
-
-	// posredujemo naprej v verigo
-	if err := s.propagateToSuccessor(ctx, pb.OpType_OP_UPDATE, message); err != nil {
-		return nil, err
-	}
-
-	// if we are tail, send acknowledgment back
-	if isTail && pred != nil {
-		conn, err := grpc.NewClient(pred.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err == nil {
-			defer conn.Close()
-			client := pb.NewMessageBoardClient(conn)
-			ackReq := &pb.AckRequest{
-				SequenceNumber: seqNum,
-				OpType:         pb.OpType_OP_UPDATE,
-				EntityId:       messageID,
-				TopicId:        topicID,
-			}
-			_, _ = client.AckUpdate(ctx, ackReq)
-		}
-	}
-
-	return message, nil
-}
-
-// PropagateDelete prejme DELETE operacijo od predecessor vozlišča
-func (s *messageBoardServer) PropagateDelete(ctx context.Context, request *pb.DeleteMessageRequest) (*emptypb.Empty, error) {
-	s.lock.Lock()
-
-	// preverimo, če user obstaja
-	if _, ok := s.users[request.GetUserId()]; !ok {
-		s.lock.Unlock()
-		return nil, fmt.Errorf("user %d does not exist", request.GetUserId())
-	}
-
-	// preverimo, če user obstaja
-	tMessages, ok := s.messages[request.GetTopicId()]
-	if !ok {
-		s.lock.Unlock()
-		return nil, fmt.Errorf("topic %d does not exist", request.GetTopicId())
-	}
-
-	// preverimo, če sporočilo obstaja
-	message, ok := tMessages[request.GetMessageId()]
-	if !ok {
-		s.lock.Unlock()
-		return nil, fmt.Errorf("message %d does not exist", request.GetMessageId())
-	}
-
-	// preverimo, da je to sporočilo od ustreznega uporabnika
-	if message.UserId != request.GetUserId() {
-		s.lock.Unlock()
-		return nil, fmt.Errorf("user %d is not the author of message %d", request.GetUserId(), request.GetMessageId())
-	}
-
-	seqNum := request.GetSequenceNumber()
-	message.SequenceNumber = seqNum
-
-	// Validate sequence number to ensure operations arrive in order
-	if err := s.validateSequenceNumber(seqNum); err != nil {
-		s.lock.Unlock()
-		return nil, err
-	}
-
-	event := s.newMessageEvent(pb.OpType_OP_DELETE, message)
-
-	// izbrišemo sporočilo
-	delete(tMessages, request.GetMessageId())
-
-	s.broadcastEvent(event)
-
-	isTail := s.isTail()
-	pred := s.predecessor
-	topicID := request.GetTopicId()
-	messageID := request.GetMessageId()
-
-	s.lock.Unlock()
-
-	// posredujemo naprej v verigo
-	if err := s.propagateToSuccessor(ctx, pb.OpType_OP_DELETE, message); err != nil {
-		return nil, err
-	}
-
-	// if we are tail, send acknowledgment back
-	if isTail && pred != nil {
-		conn, err := grpc.NewClient(pred.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err == nil {
-			defer conn.Close()
-			client := pb.NewMessageBoardClient(conn)
-			ackReq := &pb.AckRequest{
-				SequenceNumber: seqNum,
-				OpType:         pb.OpType_OP_DELETE,
-				EntityId:       messageID,
-				TopicId:        topicID,
-			}
-			_, _ = client.AckDelete(ctx, ackReq)
-		}
-	}
-
-	return &emptypb.Empty{}, nil
-}
-
-// PropagateLike prejme LIKE operacijo od predecessor vozlišča
-func (s *messageBoardServer) PropagateLike(ctx context.Context, request *pb.LikeMessageRequest) (*pb.Message, error) {
-	s.lock.Lock()
-
-	// preverimo, da uporabnik obstaja, da lahko všečka
-	if _, ok := s.users[request.GetUserId()]; !ok {
-		s.lock.Unlock()
-		return nil, fmt.Errorf("user %d does not exist", request.GetUserId())
-	}
-
-	// preverimo, da tema obstaja
-	tMessages, ok := s.messages[request.GetTopicId()]
-	if !ok {
-		s.lock.Unlock()
-		return nil, fmt.Errorf("topic %d does not exist", request.GetTopicId())
-	}
-
-	// preverimo, da sporočilo obstaja
-	message, ok := tMessages[request.GetMessageId()]
-	if !ok {
-		s.lock.Unlock()
-		return nil, fmt.Errorf("message %d does not exist", request.GetMessageId())
-	}
-
-	// povečamo število všečkov
-	seqNum := request.GetSequenceNumber()
-
-	// Validate sequence number to ensure operations arrive in order
-	if err := s.validateSequenceNumber(seqNum); err != nil {
-		s.lock.Unlock()
-		return nil, err
-	}
-
-	message.Likes++
-	message.SequenceNumber = seqNum
-	message.Committed = false
-
-	event := s.newMessageEvent(pb.OpType_OP_LIKE, message)
-	s.broadcastEvent(event)
-
-	isTail := s.isTail()
-	pred := s.predecessor
-	topicID := request.GetTopicId()
-	messageID := request.GetMessageId()
-
-	s.lock.Unlock()
-
-	// posredujemo naprej v verigo
-	if err := s.propagateToSuccessor(ctx, pb.OpType_OP_LIKE, message); err != nil {
-		return nil, err
-	}
-
-	// if we are tail, send acknowledgment back
-	if isTail && pred != nil {
-		conn, err := grpc.NewClient(pred.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err == nil {
-			defer conn.Close()
-			client := pb.NewMessageBoardClient(conn)
-			ackReq := &pb.AckRequest{
-				SequenceNumber: seqNum,
-				OpType:         pb.OpType_OP_LIKE,
-				EntityId:       messageID,
-				TopicId:        topicID,
-			}
-			_, _ = client.AckLike(ctx, ackReq)
-		}
-	}
-
-	return message, nil
-}
-
-// PropagateCreateUser prejme CreateUser operacijo od predecessor vozlišča
-func (s *messageBoardServer) PropagateCreateUser(ctx context.Context, request *pb.CreateUserRequest) (*pb.User, error) {
-	s.lock.Lock()
-
-	// preverjanje unikatnosti imena
-	for _, user := range s.users {
-		if user.Name == request.GetName() {
-			s.lock.Unlock()
-			return nil, fmt.Errorf("username taken")
-		}
-	}
-
-	// uporabimo ID, ki ga je določil head (poslan v requestu), namesto da ustvarjamo novega
-	id := request.GetId()
-	if id == 0 {
-		// generiraj ID, če ni podan (naj se ne bi zgodilo)
-		s.nextUserID++
-		id = s.nextUserID
-	} else {
-		// posodobi števec ID-jev, da ustreza prejetemu ID-ju (od heada)
-		if id > s.nextUserID {
-			s.nextUserID = id
-		}
-	}
-
-	seqNum := request.GetSequenceNumber()
-
-	// Validate sequence number to ensure operations arrive in order
-	if err := s.validateSequenceNumber(seqNum); err != nil {
-		s.lock.Unlock()
-		return nil, err
-	}
-
-	// sestavimo novega userja
-	user := &pb.User{
-		Id:             id,
-		Name:           request.GetName(),
-		SequenceNumber: seqNum,
-		Committed:      false,
-	}
-
-	// shranimo v bazo
-	s.users[id] = user
-
-	isTail := s.isTail()
-	pred := s.predecessor
-
-	s.lock.Unlock()
-
-	// posredujemo naprej v verigo samo če nismo tail
-	if !isTail {
-		if err := s.propagateCreateUser(ctx, user); err != nil {
+	// Forward to successor with retry (lets CP rewire chain on failure)
+	if hasSucc {
+		if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
+			// If we cannot forward and we're not tail, caller should retry after chain reconfig.
+			// We still keep the entry locally; it will be forwarded once successor changes.
 			return nil, err
 		}
 	}
 
-	// if we are tail, send acknowledgment back
-	if isTail && pred != nil {
-		conn, err := grpc.NewClient(pred.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			return nil, fmt.Errorf("failed to connect to predecessor for ack: %v", err)
-		}
-		defer conn.Close()
-		client := pb.NewMessageBoardClient(conn)
-		ackReq := &pb.AckRequest{
-			SequenceNumber: seqNum,
-			OpType:         pb.OpType_OP_POST, // using POST as generic op type for create
-			EntityId:       id,
-			TopicId:        0,
-		}
-		_, err = client.AckCreateUser(ctx, ackReq)
-		if err != nil {
-			return nil, fmt.Errorf("failed to send ack: %v", err)
-		}
+	if isTail {
+		s.lock.Lock()
+		s.noteAck(entry.GetSequenceNumber())
+		s.lock.Unlock()
+		s.sendAckToPredecessor(ctx, entry.GetSequenceNumber())
 	}
 
-	return user, nil
+	return &emptypb.Empty{}, nil
 }
 
-// PropagateCreateTopic prejme CreateTopic operacijo od predecessor vozlišča
-func (s *messageBoardServer) PropagateCreateTopic(ctx context.Context, request *pb.CreateTopicRequest) (*pb.Topic, error) {
+func (s *messageBoardServer) Ack(ctx context.Context, request *pb.AckRequest) (*emptypb.Empty, error) {
+	seq := request.GetSequenceNumber()
+
 	s.lock.Lock()
-
-	// uporabimo ID, ki ga je določil head (poslan v requestu), namesto da ustvarjamo novega
-	id := request.GetId()
-	if id == 0 {
-		// generiraj ID, če ni podan (naj se ne bi zgodilo)
-		s.nextTopicID++
-		id = s.nextTopicID
-	} else {
-		// posodobi števec ID-jev, da ustreza prejetemu ID-ju (od heada)
-		if id > s.nextTopicID {
-			s.nextTopicID = id
-		}
-	}
-
-	seqNum := request.GetSequenceNumber()
-
-	// Validate sequence number to ensure operations arrive in order
-	if err := s.validateSequenceNumber(seqNum); err != nil {
-		s.lock.Unlock()
-		return nil, err
-	}
-
-	topic := &pb.Topic{
-		Id:             id,
-		Name:           request.GetName(),
-		SequenceNumber: seqNum,
-		Committed:      false,
-	}
-
-	s.topics[id] = topic
-
-	// za vsak nov topic pripravimo mapo za sporočila
-	if _, ok := s.messages[id]; !ok {
-		s.messages[id] = make(map[int64]*pb.Message)
-	}
-
-	if _, ok := s.nextMessageID[id]; !ok {
-		s.nextMessageID[id] = 0
-	}
-
-	if _, ok := s.postEvents[id]; !ok {
-		s.postEvents[id] = make(map[int64]*pb.MessageEvent)
-	}
-
-	isTail := s.isTail()
-	pred := s.predecessor
-
+	s.noteAck(seq)
+	isHead := s.address == s.headAddress
 	s.lock.Unlock()
 
-	// posredujemo naprej v verigo samo če nismo tail
-	if !isTail {
-		if err := s.propagateCreateTopic(ctx, topic); err != nil {
-			return nil, err
-		}
-	}
-
-	// if we are tail, send acknowledgment back
-	if isTail && pred != nil {
-		conn, err := grpc.NewClient(pred.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			return nil, fmt.Errorf("failed to connect to predecessor for ack: %v", err)
-		}
-		defer conn.Close()
-		client := pb.NewMessageBoardClient(conn)
-		ackReq := &pb.AckRequest{
-			SequenceNumber: seqNum,
-			OpType:         pb.OpType_OP_POST, // using POST as generic op type for create
-			EntityId:       id,
-			TopicId:        id,
-		}
-		_, err = client.AckCreateTopic(ctx, ackReq)
-		if err != nil {
-			return nil, fmt.Errorf("failed to send ack: %v", err)
-		}
-	}
-
-	return topic, nil
-}
-
-// PropagateToken prejme token od drugega vozlišča in ga shrani lokalno
-// To omogoča load balancing subscriptions across nodes
-func (s *messageBoardServer) PropagateToken(ctx context.Context, request *pb.TokenPropagationRequest) (*emptypb.Empty, error) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
-
-	// shranimo token v lokalnem store-u
-	s.tokens[request.GetToken()] = &SubscriptionTokenInfo{
-		UserID: request.GetUserId(),
-		Topics: request.GetTopicId(),
-	}
-
-	return &emptypb.Empty{}, nil
-}
-
-// Acknowledgment RPC handlers - called by successor to confirm operation completion
-
-// AckPost handles acknowledgment for POST operations
-func (s *messageBoardServer) AckPost(ctx context.Context, request *pb.AckRequest) (*emptypb.Empty, error) {
-	if s.isHead() {
-		s.sendAck(request.GetSequenceNumber())
+	if isHead {
+		s.signalAck(seq)
 		return &emptypb.Empty{}, nil
 	}
 
-	s.lock.RLock()
-	pred := s.predecessor
-	s.lock.RUnlock()
-
-	if pred != nil {
-		conn, err := grpc.NewClient(pred.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err == nil {
-			defer conn.Close()
-			client := pb.NewMessageBoardClient(conn)
-			_, _ = client.AckPost(ctx, request)
-		}
-	}
-
+	s.sendAckToPredecessor(ctx, seq)
 	return &emptypb.Empty{}, nil
 }
 
-// AckUpdate handles acknowledgment for UPDATE operations
-func (s *messageBoardServer) AckUpdate(ctx context.Context, request *pb.AckRequest) (*emptypb.Empty, error) {
-	if s.isHead() {
-		s.sendAck(request.GetSequenceNumber())
-		return &emptypb.Empty{}, nil
-	}
-
+func (s *messageBoardServer) GetLastApplied(ctx context.Context, _ *pb.GetLastAppliedRequest) (*pb.GetLastAppliedResponse, error) {
 	s.lock.RLock()
-	pred := s.predecessor
-	s.lock.RUnlock()
-
-	if pred != nil {
-		conn, err := grpc.NewClient(pred.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err == nil {
-			defer conn.Close()
-			client := pb.NewMessageBoardClient(conn)
-			_, _ = client.AckUpdate(ctx, request)
-		}
-	}
-
-	return &emptypb.Empty{}, nil
+	defer s.lock.RUnlock()
+	return &pb.GetLastAppliedResponse{LastAppliedSeq: s.lastAppliedSeq}, nil
 }
 
-// AckDelete handles acknowledgment for DELETE operations
-func (s *messageBoardServer) AckDelete(ctx context.Context, request *pb.AckRequest) (*emptypb.Empty, error) {
-	if s.isHead() {
-		s.sendAck(request.GetSequenceNumber())
-		return &emptypb.Empty{}, nil
-	}
-
+func (s *messageBoardServer) SyncFrom(ctx context.Context, request *pb.SyncFromRequest) (*pb.SyncFromResponse, error) {
+	from := request.GetFromSeqExclusive()
 	s.lock.RLock()
-	pred := s.predecessor
-	s.lock.RUnlock()
+	defer s.lock.RUnlock()
 
-	if pred != nil {
-		conn, err := grpc.NewClient(pred.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err == nil {
-			defer conn.Close()
-			client := pb.NewMessageBoardClient(conn)
-			_, _ = client.AckDelete(ctx, request)
+	seqs := make([]int64, 0, len(s.logEntries))
+	for seq := range s.logEntries {
+		if seq > from {
+			seqs = append(seqs, seq)
 		}
 	}
+	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
 
-	return &emptypb.Empty{}, nil
+	out := &pb.SyncFromResponse{Entries: make([]*pb.LogEntry, 0, len(seqs))}
+	for _, seq := range seqs {
+		out.Entries = append(out.Entries, s.logEntries[seq])
+	}
+	return out, nil
 }
 
-// AckLike handles acknowledgment for LIKE operations
-func (s *messageBoardServer) AckLike(ctx context.Context, request *pb.AckRequest) (*emptypb.Empty, error) {
-	if s.isHead() {
-		s.sendAck(request.GetSequenceNumber())
-		return &emptypb.Empty{}, nil
-	}
+////////////////////////////////////////////////////////////////////////////////
+// Control plane -> node chain configuration
+////////////////////////////////////////////////////////////////////////////////
 
-	s.lock.RLock()
-	pred := s.predecessor
-	s.lock.RUnlock()
-
-	if pred != nil {
-		conn, err := grpc.NewClient(pred.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err == nil {
-			defer conn.Close()
-			client := pb.NewMessageBoardClient(conn)
-			_, _ = client.AckLike(ctx, request)
-		}
-	}
-
-	return &emptypb.Empty{}, nil
-}
-
-// AckCreateUser handles acknowledgment for CREATE USER operations
-func (s *messageBoardServer) AckCreateUser(ctx context.Context, request *pb.AckRequest) (*emptypb.Empty, error) {
-	if s.isHead() {
-		s.sendAck(request.GetSequenceNumber())
-		return &emptypb.Empty{}, nil
-	}
-
-	s.lock.RLock()
-	pred := s.predecessor
-	s.lock.RUnlock()
-
-	if pred != nil {
-		conn, err := grpc.NewClient(pred.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err == nil {
-			defer conn.Close()
-			client := pb.NewMessageBoardClient(conn)
-			_, _ = client.AckCreateUser(ctx, request)
-		}
-	}
-
-	return &emptypb.Empty{}, nil
-}
-
-// AckCreateTopic handles acknowledgment for CREATE TOPIC operations
-func (s *messageBoardServer) AckCreateTopic(ctx context.Context, request *pb.AckRequest) (*emptypb.Empty, error) {
-	if s.isHead() {
-		s.sendAck(request.GetSequenceNumber())
-		return &emptypb.Empty{}, nil
-	}
-
-	s.lock.RLock()
-	pred := s.predecessor
-	s.lock.RUnlock()
-
-	if pred != nil {
-		conn, err := grpc.NewClient(pred.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err == nil {
-			defer conn.Close()
-			client := pb.NewMessageBoardClient(conn)
-			_, _ = client.AckCreateTopic(ctx, request)
-		}
-	}
-
-	return &emptypb.Empty{}, nil
-}
-
-// ConfigureChain konfigurira verigo replikacije
 func (s *messageBoardServer) ConfigureChain(ctx context.Context, request *pb.ConfigureChainRequest) (*emptypb.Empty, error) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
-
-	nodes := request.GetNodes()
-	s.chain = nodes
-
-	// set head and tail addresses
-	if len(nodes) > 0 {
-		s.headAddress = nodes[0].GetAddress()
-		s.tailAddress = nodes[len(nodes)-1].GetAddress()
-	} else {
-		s.headAddress = s.address
-		s.tailAddress = s.address
+	if err := s.applyChainConfig(request.GetNodes()); err != nil {
+		return nil, err
 	}
-
-	// inicializiramo števce naročnin za vsa vozlišča v verigi
-	for _, node := range nodes {
-		if _, ok := s.nodeSubscriptionCount[node.GetNodeId()]; !ok {
-			s.nodeSubscriptionCount[node.GetNodeId()] = 0
-		}
-	}
-
-	// poiščemo svoj položaj v verigi
-	var myIndex int = -1
-	for i, node := range nodes {
-		if node.GetNodeId() == s.nodeID {
-			myIndex = i
-			break
-		}
-	}
-
-	if myIndex == -1 {
-		return nil, fmt.Errorf("this node (%s) is not in the chain", s.nodeID)
-	}
-
-	// nastavimo predecessor
-	if myIndex > 0 {
-		s.predecessor = nodes[myIndex-1]
-	} else {
-		s.predecessor = nil
-	}
-
-	// nastavimo successor
-	if myIndex < len(nodes)-1 {
-		s.successor = nodes[myIndex+1]
-
-		// ustvarimo gRPC povezavo do successorja
-		conn, err := grpc.NewClient(s.successor.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			return nil, fmt.Errorf("failed to connect to successor: %v", err)
-		}
-		s.successorClient = pb.NewMessageBoardClient(conn)
-	} else {
-		s.successor = nil
-		s.successorClient = nil
-	}
-
-	log.Printf("Chain configured: position %d/%d, predecessor=%v, successor=%v",
-		myIndex+1, len(nodes), s.predecessor != nil, s.successor != nil)
-
 	return &emptypb.Empty{}, nil
 }
 
-/*
-Konstruktor
-*/
-func newMessageBoardServer(nodeID, address string) *messageBoardServer {
-	return &messageBoardServer{
-		users:                 make(map[int64]*pb.User),
-		topics:                make(map[int64]*pb.Topic),
-		messages:              make(map[int64]map[int64]*pb.Message),
-		nextMessageID:         make(map[int64]int64),
-		postEvents:            make(map[int64]map[int64]*pb.MessageEvent),
-		tokens:                make(map[string]*SubscriptionTokenInfo),
-		subscribers:           make(map[int64]*subscription),
-		nodeID:                nodeID,
-		address:               address,
-		chain:                 make([]*pb.NodeInfo, 0),
-		nodeSubscriptionCount: make(map[string]int64),
-		ackChannels:           make(map[int64]chan bool),
-		headAddress:           address, // initially, this node is both head and tail
-		tailAddress:           address,
+////////////////////////////////////////////////////////////////////////////////
+// Token helpers (HMAC signed)
+////////////////////////////////////////////////////////////////////////////////
+
+func (s *messageBoardServer) makeSubscribeToken(userID int64, topics []int64, exp int64) (string, error) {
+	payload := tokenPayload{UserID: userID, Topics: append([]int64(nil), topics...), Exp: exp}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
 	}
+	b64 := base64.RawURLEncoding.EncodeToString(raw)
+	sig := s.sign([]byte(b64))
+	return b64 + "." + sig, nil
 }
 
-// glavna funkcija - gRPC strežnik
+func (s *messageBoardServer) validateSubscribeToken(token string, userID int64) ([]int64, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("subscribe token not valid")
+	}
+	b64 := parts[0]
+	sig := parts[1]
+	if !hmac.Equal([]byte(sig), []byte(s.sign([]byte(b64)))) {
+		return nil, fmt.Errorf("subscribe token not valid")
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(b64)
+	if err != nil {
+		return nil, fmt.Errorf("subscribe token not valid")
+	}
+	var p tokenPayload
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return nil, fmt.Errorf("subscribe token not valid")
+	}
+	if p.UserID != userID {
+		return nil, fmt.Errorf("subscribe token not valid")
+	}
+	if time.Now().Unix() > p.Exp {
+		return nil, fmt.Errorf("subscribe token expired")
+	}
+	return p.Topics, nil
+}
+
+func (s *messageBoardServer) sign(data []byte) string {
+	mac := hmac.New(sha256.New, s.tokenSecret)
+	_, _ = mac.Write(data)
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// main
+////////////////////////////////////////////////////////////////////////////////
+
 func main() {
 	nodeID := flag.String("n", "node-1", "node ID")
-	address := flag.Int("a", 50051, "listen address")
+	port := flag.Int("a", 50051, "listen port")
+	controlAddr := flag.String("c", "localhost:60000", "control plane address host:port")
+	secret := flag.String("secret", "dev-secret-change-me", "token signing secret (must match across nodes)")
 	flag.Parse()
 
-	grpcStreznik := grpc.NewServer() //ustvari nov gRPC strežnik
+	addr := fmt.Sprintf("localhost:%d", *port)
 
-	url := fmt.Sprintf("localhost:%d", *address)
-
-	streznik := newMessageBoardServer(*nodeID, url) // ustvarimo strežnik
-
-	pb.RegisterMessageBoardServer(grpcStreznik, streznik) // registriramo oba servisa, ta je glavni za večino funkcij odjemalca
-	pb.RegisterControlPlaneServer(grpcStreznik, streznik) //nadzorna ravnina
-
-	// odpremo TCP port
-	listen, err := net.Listen("tcp", url)
+	lis, err := net.Listen("tcp", addr)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
-	log.Printf("MessageBoard server %s listening on %s", *nodeID, url)
+	s := newMessageBoardServer(*nodeID, addr, *controlAddr, *secret)
 
-	if err := grpcStreznik.Serve(listen); err != nil {
-		panic(err)
+	grpcServer := grpc.NewServer()
+	pb.RegisterMessageBoardServer(grpcServer, s)
+
+	// Start join + heartbeat
+	s.joinControlPlane()
+	go s.heartbeatLoop()
+
+	log.Printf("MessageBoard node %s listening on %s (control=%s)", *nodeID, addr, *controlAddr)
+	if err := grpcServer.Serve(lis); err != nil {
+		log.Fatal(err)
 	}
 }
