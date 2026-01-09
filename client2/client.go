@@ -8,11 +8,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	pb "razpravljalnica/pb" //import pb.go datoteke
+	pb "razpravljalnica/pb"
 
-	"google.golang.org/grpc" //glavna knjižnica za grpc
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/protobuf/types/known/emptypb" //import zaradi google.protobuf.Empty, ki ga uporabimo v metodah, kazalec na "nic"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 var reqCounter atomic.Int64
@@ -56,7 +56,6 @@ func recvEvents(name string, stream pb.MessageBoard_SubscribeTopicClient, stopAf
 }
 
 func main() {
-	// preberemo argumente iz ukazne vrstice
 	hostPtr := flag.String("s", "localhost", "server host (default localhost)")
 	hPtr := flag.Int("h", 50051, "head port number")
 	tPtr := flag.Int("t", 50053, "tail port number")
@@ -116,11 +115,10 @@ func main() {
 	defer headConn.Close()
 	defer tailConn.Close()
 
-	// vzpostavimo vmesnik gRPC
 	grpcHeadClient := pb.NewMessageBoardClient(headConn)
 	grpcTailClient := pb.NewMessageBoardClient(tailConn)
 
-	// --- Basic negative tests (real clients handle errors, don't panic) ---
+	// --- Basic negative tests ---
 	{
 		ctx, cancel := withTimeout(baseCtx, *timeoutPtr)
 		_, err := grpcTailClient.CreateUser(ctx, &pb.CreateUserRequest{Name: "should-fail", RequestId: newRequestID("create-user")})
@@ -139,10 +137,14 @@ func main() {
 	var wg sync.WaitGroup
 	subDone := make(chan struct{}, 2)
 
-	fmt.Println("\nCreating user ID=1.")
+	// IMPORTANT: different usernames from the other client.
+	userNameA := "janez-2"
+	userNameB := "miha-2"
+
+	fmt.Println("\nCreating user A.")
 	createUserRID := newRequestID("create-user")
 	ctx, cancel := withTimeout(baseCtx, *timeoutPtr)
-	user, err := grpcHeadClient.CreateUser(ctx, &pb.CreateUserRequest{Name: "janez", RequestId: createUserRID})
+	user, err := grpcHeadClient.CreateUser(ctx, &pb.CreateUserRequest{Name: userNameA, RequestId: createUserRID})
 	cancel()
 	if err != nil {
 		fmt.Printf("CreateUser failed: %v\n", err)
@@ -151,16 +153,16 @@ func main() {
 	fmt.Printf("Created user: %v (ID: %v)\n", user.Name, user.Id)
 	time.Sleep(actionDelay)
 
-	// Idempotency demo (same request_id should return same result).
+	// Idempotency demo
 	ctx, cancel = withTimeout(baseCtx, *timeoutPtr)
-	userAgain, err := grpcHeadClient.CreateUser(ctx, &pb.CreateUserRequest{Name: "janez", RequestId: createUserRID})
+	userAgain, err := grpcHeadClient.CreateUser(ctx, &pb.CreateUserRequest{Name: userNameA, RequestId: createUserRID})
 	cancel()
 	fmt.Printf("CreateUser idempotent: id=%d err=%v\n", userAgain.GetId(), err)
 	time.Sleep(actionDelay)
 
-	fmt.Println("\nCreating user ID=2.")
+	fmt.Println("\nCreating user B.")
 	ctx, cancel = withTimeout(baseCtx, *timeoutPtr)
-	user1, err := grpcHeadClient.CreateUser(ctx, &pb.CreateUserRequest{Name: "Miha", RequestId: newRequestID("create-user")})
+	user1, err := grpcHeadClient.CreateUser(ctx, &pb.CreateUserRequest{Name: userNameB, RequestId: newRequestID("create-user")})
 	cancel()
 	if err != nil {
 		fmt.Printf("CreateUser failed: %v\n", err)
@@ -171,7 +173,7 @@ func main() {
 
 	fmt.Println("\nCreating topics.")
 	ctx, cancel = withTimeout(baseCtx, *timeoutPtr)
-	topic1, err := grpcHeadClient.CreateTopic(ctx, &pb.CreateTopicRequest{Name: "Prva tema", RequestId: newRequestID("create-topic")})
+	topic1, err := grpcHeadClient.CreateTopic(ctx, &pb.CreateTopicRequest{Name: "Tretja tema", RequestId: newRequestID("create-topic")})
 	cancel()
 	if err != nil {
 		fmt.Printf("CreateTopic failed: %v\n", err)
@@ -179,7 +181,7 @@ func main() {
 	}
 	time.Sleep(actionDelay)
 	ctx, cancel = withTimeout(baseCtx, *timeoutPtr)
-	topic2, err := grpcHeadClient.CreateTopic(ctx, &pb.CreateTopicRequest{Name: "Druga tema", RequestId: newRequestID("create-topic")})
+	topic2, err := grpcHeadClient.CreateTopic(ctx, &pb.CreateTopicRequest{Name: "Četrta tema", RequestId: newRequestID("create-topic")})
 	cancel()
 	if err != nil {
 		fmt.Printf("CreateTopic failed: %v\n", err)
@@ -202,18 +204,17 @@ func main() {
 	}
 	time.Sleep(actionDelay)
 
-	fmt.Println("\nSubscribing to topics (user janez).")
+	fmt.Println("\nSubscribing to topics (user A).")
 	ctx, cancel = withTimeout(baseCtx, *timeoutPtr)
-	subNode, err := grpcHeadClient.GetSubscriptionNode(ctx, &pb.SubscriptionNodeRequest{UserId: user.Id, TopicId: []int64{topic1.Id, topic2.Id}})
+	subNode, err := grpcHeadClient.GetSubscriptionNode(ctx, &pb.SubscriptionNodeRequest{UserId: user.Id, TopicId: []int64{topic1.Id, topic2.Id, 1}})
 	cancel()
 	if err != nil {
 		fmt.Printf("GetSubscriptionNode failed: %v\n", err)
 		return
 	}
-	fmt.Printf("Subscribed to topics with token: %v from node %v\n", subNode.SubscribeToken, subNode.Node.NodeId)
+	fmt.Printf("Subscribed with token from node %v\n", subNode.Node.NodeId)
 	time.Sleep(actionDelay)
 
-	// Start subscription stream for janez (auto-stops after a few events or after sub timeout).
 	{
 		subConn, err := dial(subNode.Node.Address)
 		if err != nil {
@@ -227,20 +228,20 @@ func main() {
 			defer wg.Done()
 			defer subCancel()
 			defer subConn.Close()
-			fmt.Println("\n[janez] Starting to listen for new messages...")
-			stream, err := grpcSubClient.SubscribeTopic(subCtx, &pb.SubscribeTopicRequest{TopicId: []int64{topic1.Id, topic2.Id}, UserId: user.Id, FromMessageId: 0, SubscribeToken: subNode.SubscribeToken})
+			fmt.Println("\n[janez-2] Starting to listen for new messages...")
+			stream, err := grpcSubClient.SubscribeTopic(subCtx, &pb.SubscribeTopicRequest{TopicId: []int64{topic1.Id, topic2.Id, 1}, UserId: user.Id, FromMessageId: 0, SubscribeToken: subNode.SubscribeToken})
 			if err != nil {
-				fmt.Printf("[janez] SubscribeTopic failed: %v\n", err)
+				fmt.Printf("[janez-2] SubscribeTopic failed: %v\n", err)
 				subDone <- struct{}{}
 				return
 			}
-			recvEvents("janez", stream, 6, subDone)
+			recvEvents("janez-2", stream, 6, subDone)
 		}()
 	}
 
 	fmt.Println("\nPosting message1.")
 	ctx, cancel = withTimeout(baseCtx, *timeoutPtr)
-	message1, err := grpcHeadClient.PostMessage(ctx, &pb.PostMessageRequest{Text: "Prvo sporočilo v prvi temi", TopicId: topic1.Id, UserId: user.Id, RequestId: newRequestID("post")})
+	message1, err := grpcHeadClient.PostMessage(ctx, &pb.PostMessageRequest{Text: "Prvo sporočilo v tretji temi", TopicId: topic1.Id, UserId: user.Id, RequestId: newRequestID("post")})
 	cancel()
 	if err != nil {
 		fmt.Printf("PostMessage failed: %v\n", err)
@@ -251,7 +252,7 @@ func main() {
 
 	fmt.Println("\nPosting message2.")
 	ctx, cancel = withTimeout(baseCtx, *timeoutPtr)
-	message2, err := grpcHeadClient.PostMessage(ctx, &pb.PostMessageRequest{Text: "Drugo sporočilo v prvi temi", TopicId: topic1.Id, UserId: user.Id, RequestId: newRequestID("post")})
+	message2, err := grpcHeadClient.PostMessage(ctx, &pb.PostMessageRequest{Text: "Drugo sporočilo v tretji temi", TopicId: topic1.Id, UserId: user.Id, RequestId: newRequestID("post")})
 	cancel()
 	if err != nil {
 		fmt.Printf("PostMessage failed: %v\n", err)
@@ -268,7 +269,7 @@ func main() {
 		fmt.Printf("GetMessages failed: %v\n", err)
 		return
 	}
-	fmt.Println("Messages in topic 1:")
+	fmt.Println("Messages in topic 3:")
 	for _, message := range messages.Messages {
 		fmt.Printf("- %v (ID: %v, Likes: %v)\n", message.Text, message.Id, message.Likes)
 	}
@@ -276,7 +277,7 @@ func main() {
 
 	fmt.Println("\nPosting message3.")
 	ctx, cancel = withTimeout(baseCtx, *timeoutPtr)
-	message3, err := grpcHeadClient.PostMessage(ctx, &pb.PostMessageRequest{Text: "Prvo sporočilo v drugi temi", TopicId: topic2.Id, UserId: user.Id, RequestId: newRequestID("post")})
+	message3, err := grpcHeadClient.PostMessage(ctx, &pb.PostMessageRequest{Text: "Prvo sporočilo v četrti temi", TopicId: topic2.Id, UserId: user.Id, RequestId: newRequestID("post")})
 	cancel()
 	if err != nil {
 		fmt.Printf("PostMessage failed: %v\n", err)
@@ -287,7 +288,7 @@ func main() {
 
 	fmt.Println("\nUpdating message2.")
 	ctx, cancel = withTimeout(baseCtx, *timeoutPtr)
-	_, err = grpcHeadClient.UpdateMessage(ctx, &pb.UpdateMessageRequest{TopicId: topic1.Id, UserId: user.Id, MessageId: message2.Id, Text: "Posodobljeno drugo sporočilo v prvi temi", RequestId: newRequestID("update")})
+	_, err = grpcHeadClient.UpdateMessage(ctx, &pb.UpdateMessageRequest{TopicId: topic1.Id, UserId: user.Id, MessageId: message2.Id, Text: "Posodobljeno drugo sporočilo v tretji temi", RequestId: newRequestID("update")})
 	cancel()
 	if err != nil {
 		fmt.Printf("UpdateMessage failed: %v\n", err)
@@ -296,7 +297,6 @@ func main() {
 	fmt.Println("Message2 updated.")
 	time.Sleep(actionDelay)
 
-	// Authorization error demo: wrong user updates
 	ctx, cancel = withTimeout(baseCtx, *timeoutPtr)
 	_, err = grpcHeadClient.UpdateMessage(ctx, &pb.UpdateMessageRequest{TopicId: topic1.Id, UserId: user1.Id, MessageId: message2.Id, Text: "this should fail", RequestId: newRequestID("update")})
 	cancel()
@@ -311,7 +311,7 @@ func main() {
 		fmt.Printf("GetMessages failed: %v\n", err)
 		return
 	}
-	fmt.Println("Messages in topic 1 from message ID 2:")
+	fmt.Println("Messages in topic 3 from message ID 2:")
 	for _, message := range messages.Messages {
 		fmt.Printf("- %v (ID: %v, Likes: %v)\n", message.Text, message.Id, message.Likes)
 	}
@@ -329,7 +329,6 @@ func main() {
 	fmt.Println("Message1 deleted.")
 	time.Sleep(actionDelay)
 
-	// Idempotent delete: repeat with same request_id.
 	ctx, cancel = withTimeout(baseCtx, *timeoutPtr)
 	_, err = grpcHeadClient.DeleteMessage(ctx, &pb.DeleteMessageRequest{TopicId: topic1.Id, UserId: user.Id, MessageId: message1.Id, RequestId: deleteRID})
 	cancel()
@@ -344,7 +343,7 @@ func main() {
 		fmt.Printf("GetMessages failed: %v\n", err)
 		return
 	}
-	fmt.Println("Messages in topic 1 with limit 1:")
+	fmt.Println("Messages in topic 3 with limit 1:")
 	for _, message := range messages.Messages {
 		fmt.Printf("- %v (ID: %v, Likes: %v)\n", message.Text, message.Id, message.Likes)
 	}
@@ -370,21 +369,21 @@ func main() {
 		fmt.Printf("GetMessages failed: %v\n", err)
 		return
 	}
-	fmt.Println("Messages in topic 2:")
+	fmt.Println("Messages in topic 4:")
 	for _, message := range messagesTopic2.Messages {
 		fmt.Printf("- %v (ID: %v, Likes: %v)\n", message.Text, message.Id, message.Likes)
 	}
 	time.Sleep(actionDelay)
 
-	fmt.Println("\nSubscribing to topics (user Miha).")
+	fmt.Println("\nSubscribing to topics (user B).")
 	ctx, cancel = withTimeout(baseCtx, *timeoutPtr)
-	subNode1, err := grpcHeadClient.GetSubscriptionNode(ctx, &pb.SubscriptionNodeRequest{UserId: user1.Id, TopicId: []int64{topic1.Id, topic2.Id}})
+	subNode1, err := grpcHeadClient.GetSubscriptionNode(ctx, &pb.SubscriptionNodeRequest{UserId: user1.Id, TopicId: []int64{topic1.Id, topic2.Id, 1, 2}})
 	cancel()
 	if err != nil {
 		fmt.Printf("GetSubscriptionNode failed: %v\n", err)
 		return
 	}
-	fmt.Printf("Subscribed to topics with token: %v from node %v\n", subNode1.SubscribeToken, subNode1.Node.NodeId)
+	fmt.Printf("Subscribed with token from node %v\n", subNode1.Node.NodeId)
 	time.Sleep(actionDelay)
 
 	{
@@ -400,18 +399,17 @@ func main() {
 			defer wg.Done()
 			defer subCancel()
 			defer subConn.Close()
-			fmt.Println("\n[Miha] Starting to listen for new messages...")
-			stream, err := grpcSubClient.SubscribeTopic(subCtx, &pb.SubscribeTopicRequest{TopicId: []int64{topic1.Id, topic2.Id}, UserId: user1.Id, FromMessageId: 0, SubscribeToken: subNode1.SubscribeToken})
+			fmt.Println("\n[miha-2] Starting to listen for new messages...")
+			stream, err := grpcSubClient.SubscribeTopic(subCtx, &pb.SubscribeTopicRequest{TopicId: []int64{topic1.Id, topic2.Id, 1, 2}, UserId: user1.Id, FromMessageId: 0, SubscribeToken: subNode1.SubscribeToken})
 			if err != nil {
-				fmt.Printf("[Miha] SubscribeTopic failed: %v\n", err)
+				fmt.Printf("[miha-2] SubscribeTopic failed: %v\n", err)
 				subDone <- struct{}{}
 				return
 			}
-			recvEvents("Miha", stream, 6, subDone)
+			recvEvents("miha-2", stream, 6, subDone)
 		}()
 	}
 
-	// Wait for subscriptions to finish (either by receiving events or timing out).
 	<-subDone
 	<-subDone
 	wg.Wait()

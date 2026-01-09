@@ -57,15 +57,26 @@ func newControlPlane(timeout time.Duration) *controlPlaneServer {
 	}
 }
 
+func cloneNodeInfo(n *pb.NodeInfo) *pb.NodeInfo {
+	if n == nil {
+		return nil
+	}
+	return &pb.NodeInfo{NodeId: n.GetNodeId(), Address: n.GetAddress()}
+}
+
 func (c *controlPlaneServer) GetClusterState(ctx context.Context, _ *emptypb.Empty) (*pb.GetClusterStateResponse, error) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
 	head, tail := c.getHeadTailLocked()
+	chain := make([]*pb.NodeInfo, 0, len(c.chain))
+	for _, n := range c.chain {
+		chain = append(chain, cloneNodeInfo(n))
+	}
 	return &pb.GetClusterStateResponse{
 		Head:  head,
 		Tail:  tail,
-		Chain: append([]*pb.NodeInfo(nil), c.chain...),
+		Chain: chain,
 	}, nil
 }
 
@@ -178,6 +189,7 @@ func (c *controlPlaneServer) Join(ctx context.Context, req *pb.JoinRequest) (*pb
 			alive:         true,
 		}
 		changed = c.appendToChainIfMissing(info)
+		st = c.nodes[req.GetNodeId()]
 	} else {
 		// already known (maybe via heartbeat auto-join) -> just update
 		st.info.Address = req.GetAddress()
@@ -190,7 +202,11 @@ func (c *controlPlaneServer) Join(ctx context.Context, req *pb.JoinRequest) (*pb
 	}
 
 	head, tail := c.getHeadTailLocked()
-	resp := &pb.JoinResponse{Head: head, Tail: tail, Chain: append([]*pb.NodeInfo(nil), c.chain...)}
+	chain := make([]*pb.NodeInfo, 0, len(c.chain))
+	for _, n := range c.chain {
+		chain = append(chain, cloneNodeInfo(n))
+	}
+	resp := &pb.JoinResponse{Head: head, Tail: tail, Chain: chain}
 	c.lock.Unlock()
 
 	if changed {
@@ -207,17 +223,21 @@ func (c *controlPlaneServer) Leave(ctx context.Context, req *pb.LeaveRequest) (*
 		c.chain = filterChain(c.chain, req.GetNodeId())
 	}
 	head, tail := c.getHeadTailLocked()
+	chain := make([]*pb.NodeInfo, 0, len(c.chain))
+	for _, n := range c.chain {
+		chain = append(chain, cloneNodeInfo(n))
+	}
 	c.lock.Unlock()
 
 	go c.pushChainToAll()
-	return &pb.LeaveResponse{Head: head, Tail: tail, Chain: append([]*pb.NodeInfo(nil), c.chain...)}, nil
+	return &pb.LeaveResponse{Head: head, Tail: tail, Chain: chain}, nil
 }
 
 func (c *controlPlaneServer) getHeadTailLocked() (*pb.NodeInfo, *pb.NodeInfo) {
 	if len(c.chain) == 0 {
 		return &pb.NodeInfo{NodeId: "none", Address: ""}, &pb.NodeInfo{NodeId: "none", Address: ""}
 	}
-	return c.chain[0], c.chain[len(c.chain)-1]
+	return cloneNodeInfo(c.chain[0]), cloneNodeInfo(c.chain[len(c.chain)-1])
 }
 
 func filterChain(chain []*pb.NodeInfo, nodeID string) []*pb.NodeInfo {
@@ -247,11 +267,16 @@ func (c *controlPlaneServer) appendToChainIfMissing(info *pb.NodeInfo) bool {
 	return true
 }
 
-func (c *controlPlaneServer) monitorFailuresLoop() {
+func (c *controlPlaneServer) monitorFailuresLoop(ctx context.Context) {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
-	for range ticker.C {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 		c.lock.Lock()
 		now := time.Now()
 
@@ -285,29 +310,45 @@ func (c *controlPlaneServer) monitorFailuresLoop() {
 
 func (c *controlPlaneServer) pushChainToAll() {
 	c.lock.Lock()
-	nodes := append([]*pb.NodeInfo(nil), c.chain...)
-	aliveTargets := make([]*pb.NodeInfo, 0, len(nodes))
-	for _, n := range nodes {
+	// Build snapshots under lock so we don't share mutable *pb.NodeInfo across goroutines.
+	nodes := make([]*pb.NodeInfo, 0, len(c.chain))
+	for _, n := range c.chain {
+		nodes = append(nodes, cloneNodeInfo(n))
+	}
+	aliveTargets := make([]*pb.NodeInfo, 0, len(c.chain))
+	for _, n := range c.chain {
 		if st, ok := c.nodes[n.GetNodeId()]; ok && st.alive {
-			aliveTargets = append(aliveTargets, st.info)
+			aliveTargets = append(aliveTargets, cloneNodeInfo(st.info))
 		}
 	}
 	c.lock.Unlock()
 
-	req := &pb.ConfigureChainRequest{Nodes: nodes}
 	for _, n := range aliveTargets {
-		conn, err := grpc.NewClient(n.GetAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+		c.pushChainToNode(n.GetAddress(), nodes)
+	}
+}
+
+func (c *controlPlaneServer) pushChainToNode(addr string, nodes []*pb.NodeInfo) {
+	if addr == "" {
+		return
+	}
+	// Bounded retries: helps with transient dial/startup races without needing periodic pushes.
+	for attempt := 1; attempt <= 3; attempt++ {
+		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
+			time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
 			continue
 		}
 		client := pb.NewMessageBoardClient(conn)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_, err = client.ConfigureChain(ctx, req)
-		if err != nil {
-			log.Printf("Napaka v konfiguraciji strežnika %s: %v", n.GetAddress(), err)
-		}
+		_, err = client.ConfigureChain(ctx, &pb.ConfigureChainRequest{Nodes: nodes})
 		cancel()
 		_ = conn.Close()
+		if err == nil {
+			return
+		}
+		log.Printf("Napaka v konfiguraciji strežnika %s (attempt %d/3): %v", addr, attempt, err)
+		time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
 	}
 }
 
@@ -352,6 +393,7 @@ func startServers(numServers int, headPort int, controlAddr string, secret strin
 			Port:    port,
 			Cmd:     cmd,
 		})
+		time.Sleep(500 * time.Millisecond) // small delay
 		log.Printf("Started %s (PID=%d)", nodeID, cmd.Process.Pid)
 	}
 	return servers
@@ -366,7 +408,7 @@ func main() {
 
 	// launcher options
 	launch := flag.Bool("launch", false, "also launch data-plane servers as OS processes")
-	serverBin := flag.String("serverbin", "./server", "path to server binary (used only with -launch)")
+	serverBin := flag.String("serverbin", "../server/server.exe", "path to server binary (used only with -launch)")
 
 	flag.Parse()
 
@@ -379,7 +421,7 @@ func main() {
 	}
 
 	cp := newControlPlane(time.Duration(*timeoutMs) * time.Millisecond)
-	go cp.monitorFailuresLoop()
+	go cp.monitorFailuresLoop(context.Background())
 
 	grpcServer := grpc.NewServer()
 	pb.RegisterControlPlaneServer(grpcServer, cp)
