@@ -620,31 +620,28 @@ func (s *messageBoardServer) heartbeatLoop() {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
-	for {
-		select {
-		case <-ticker.C:
-			s.lock.RLock()
-			last := s.lastAppliedSeq
-			addr := s.address
-			nodeID := s.nodeID
-			s.lock.RUnlock()
+	for range ticker.C {
+		s.lock.RLock()
+		last := s.lastAppliedSeq
+		addr := s.address
+		nodeID := s.nodeID
+		s.lock.RUnlock()
 
-			conn, err := grpc.NewClient(s.controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-			if err != nil {
-				continue
-			}
-			subCount := s.subCount.Load()
-			client := pb.NewControlPlaneClient(conn)
-			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-			_, _ = client.Heartbeat(ctx, &pb.HeartbeatRequest{
-				NodeId:         nodeID,
-				Address:        addr,
-				LastAppliedSeq: last,
-				SubCount:       subCount,
-			})
-			cancel()
-			_ = conn.Close()
+		conn, err := grpc.NewClient(s.controlAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			continue
 		}
+		subCount := s.subCount.Load()
+		client := pb.NewControlPlaneClient(conn)
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		_, _ = client.Heartbeat(ctx, &pb.HeartbeatRequest{
+			NodeId:         nodeID,
+			Address:        addr,
+			LastAppliedSeq: last,
+			SubCount:       subCount,
+		})
+		cancel()
+		_ = conn.Close()
 	}
 }
 
@@ -854,6 +851,10 @@ func (s *messageBoardServer) CreateUser(ctx context.Context, request *pb.CreateU
 	if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
 		return nil, err
 	}
+	// Single-node chain: head is also tail, so there will be no external Ack RPC.
+	if s.isTail() {
+		s.signalAck(seq)
+	}
 	if !s.waitAck(seq, 5*time.Second) {
 		return nil, fmt.Errorf("timeout waiting for ack")
 	}
@@ -915,6 +916,10 @@ func (s *messageBoardServer) CreateTopic(ctx context.Context, request *pb.Create
 
 	if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
 		return nil, err
+	}
+	// Single-node chain: head is also tail, so there will be no external Ack RPC.
+	if s.isTail() {
+		s.signalAck(seq)
 	}
 	if !s.waitAck(seq, 5*time.Second) {
 		return nil, fmt.Errorf("timeout waiting for ack")
@@ -1007,6 +1012,10 @@ func (s *messageBoardServer) PostMessage(ctx context.Context, request *pb.PostMe
 
 	if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
 		return nil, err
+	}
+	// Single-node chain: head is also tail, so there will be no external Ack RPC.
+	if s.isTail() {
+		s.signalAck(seq)
 	}
 	if !s.waitAck(seq, 5*time.Second) {
 		return nil, fmt.Errorf("timeout waiting for ack")
@@ -1105,6 +1114,10 @@ func (s *messageBoardServer) UpdateMessage(ctx context.Context, request *pb.Upda
 	if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
 		return nil, err
 	}
+	// Single-node chain: head is also tail, so there will be no external Ack RPC.
+	if s.isTail() {
+		s.signalAck(seq)
+	}
 	if !s.waitAck(seq, 5*time.Second) {
 		return nil, fmt.Errorf("timeout waiting for ack")
 	}
@@ -1182,6 +1195,10 @@ func (s *messageBoardServer) DeleteMessage(ctx context.Context, request *pb.Dele
 
 	if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
 		return nil, err
+	}
+	// Single-node chain: head is also tail, so there will be no external Ack RPC.
+	if s.isTail() {
+		s.signalAck(seq)
 	}
 	if !s.waitAck(seq, 5*time.Second) {
 		return nil, fmt.Errorf("timeout waiting for ack")
@@ -1269,6 +1286,10 @@ func (s *messageBoardServer) LikeMessage(ctx context.Context, request *pb.LikeMe
 
 	if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
 		return nil, err
+	}
+	// Single-node chain: head is also tail, so there will be no external Ack RPC.
+	if s.isTail() {
+		s.signalAck(seq)
 	}
 	if !s.waitAck(seq, 5*time.Second) {
 		return nil, fmt.Errorf("timeout waiting for ack")
@@ -1451,25 +1472,81 @@ func (s *messageBoardServer) SubscribeTopic(request *pb.SubscribeTopicRequest, s
 		}
 	}
 
+	// Live events are produced when entries are applied, but they may arrive before
+	// they are committed (acknowledged from tail). If we drop them here, the client
+	// will never see them. Buffer until committed and then flush in sequence order.
+	pending := make(map[int64]*pb.MessageEvent)
+	flushPending := func() error {
+		s.lock.RLock()
+		committedUpTo := s.lastCommittedSeq
+		s.lock.RUnlock()
+
+		if len(pending) == 0 {
+			return nil
+		}
+
+		ready := make([]int64, 0, len(pending))
+		for seq := range pending {
+			if seq <= committedUpTo {
+				ready = append(ready, seq)
+			}
+		}
+		if len(ready) == 0 {
+			return nil
+		}
+		sort.Slice(ready, func(i, j int) bool { return ready[i] < ready[j] })
+		for _, seq := range ready {
+			ev := pending[seq]
+			delete(pending, seq)
+			if ev == nil {
+				continue
+			}
+			if err := stream.Send(ev); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	flushTicker := time.NewTicker(100 * time.Millisecond)
+	defer flushTicker.Stop()
+
 	for {
 		select {
 		case <-stream.Context().Done():
 			s.removeSubscription(subID)
 			return nil
+		case <-flushTicker.C:
+			if err := flushPending(); err != nil {
+				s.removeSubscription(subID)
+				return err
+			}
 		case ev, ok := <-sub.channel:
 			if !ok {
 				s.removeSubscription(subID)
 				return nil
 			}
+
+			seq := ev.GetSequenceNumber()
 			s.lock.RLock()
-			committed := ev.GetSequenceNumber() <= s.lastCommittedSeq
+			committed := seq <= s.lastCommittedSeq
 			s.lock.RUnlock()
-			if !committed {
+			if committed {
+				if err := stream.Send(ev); err != nil {
+					s.removeSubscription(subID)
+					return err
+				}
+				// Opportunistically flush any earlier pending committed events.
+				if err := flushPending(); err != nil {
+					s.removeSubscription(subID)
+					return err
+				}
 				continue
 			}
-			if err := stream.Send(ev); err != nil {
-				s.removeSubscription(subID)
-				return err
+
+			// Not committed yet: buffer until ack advances.
+			if _, exists := pending[seq]; !exists {
+				pending[seq] = ev
 			}
 		}
 	}
