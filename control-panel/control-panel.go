@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -9,7 +11,10 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -27,6 +32,312 @@ type ServerProcess struct {
 	Address string
 	Port    int
 	Cmd     *exec.Cmd
+}
+
+type processInfo struct {
+	PID       int       `json:"pid"`
+	Address   string    `json:"address"`
+	StartedAt time.Time `json:"started_at"`
+}
+
+type processRegistry struct {
+	Version   int                    `json:"version"`
+	Processes map[string]processInfo `json:"processes"`
+}
+
+func defaultRegistryPath() string {
+	// Keep it local and obvious for demo purposes.
+	return "control-panel.processes.json"
+}
+
+func loadRegistry(path string) (processRegistry, error) {
+	reg := processRegistry{Version: 1, Processes: map[string]processInfo{}}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return reg, nil
+		}
+		return reg, err
+	}
+	if len(data) == 0 {
+		return reg, nil
+	}
+	if err := json.Unmarshal(data, &reg); err != nil {
+		return processRegistry{Version: 1, Processes: map[string]processInfo{}}, err
+	}
+	if reg.Processes == nil {
+		reg.Processes = map[string]processInfo{}
+	}
+	if reg.Version == 0 {
+		reg.Version = 1
+	}
+	return reg, nil
+}
+
+func saveRegistry(path string, reg processRegistry) error {
+	if reg.Version == 0 {
+		reg.Version = 1
+	}
+	if reg.Processes == nil {
+		reg.Processes = map[string]processInfo{}
+	}
+	data, err := json.MarshalIndent(reg, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		// if path has no dir component (relative file), Dir() returns "." and MkdirAll is fine
+		return err
+	}
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	// Windows can't replace existing file with Rename reliably; remove first.
+	_ = os.Remove(path)
+	return os.Rename(tmp, path)
+}
+
+func registerProcess(registryPath, nodeID, address string, pid int) {
+	reg, err := loadRegistry(registryPath)
+	if err != nil {
+		log.Printf("[CP] warning: failed reading registry %s: %v", registryPath, err)
+		return
+	}
+	reg.Processes[nodeID] = processInfo{PID: pid, Address: address, StartedAt: time.Now()}
+	if err := saveRegistry(registryPath, reg); err != nil {
+		log.Printf("[CP] warning: failed writing registry %s: %v", registryPath, err)
+	}
+}
+
+func unregisterProcess(registryPath, nodeID string) {
+	reg, err := loadRegistry(registryPath)
+	if err != nil {
+		return
+	}
+	delete(reg.Processes, nodeID)
+	_ = saveRegistry(registryPath, reg)
+}
+
+func killRegisteredProcess(registryPath, nodeID string) (killed bool, msg string) {
+	reg, err := loadRegistry(registryPath)
+	if err != nil {
+		return false, fmt.Sprintf("failed to read registry: %v", err)
+	}
+	info, ok := reg.Processes[nodeID]
+	if !ok {
+		return false, "no local process registered for this node id"
+	}
+	proc, err := os.FindProcess(info.PID)
+	if err != nil {
+		unregisterProcess(registryPath, nodeID)
+		return false, fmt.Sprintf("failed to find process PID=%d (removed from registry)", info.PID)
+	}
+	if err := proc.Kill(); err != nil {
+		// On Windows, Kill may fail if already exited; treat that as non-fatal and cleanup registry.
+		unregisterProcess(registryPath, nodeID)
+		return false, fmt.Sprintf("failed to kill PID=%d (removed from registry anyway): %v", info.PID, err)
+	}
+	unregisterProcess(registryPath, nodeID)
+	return true, fmt.Sprintf("killed PID=%d", info.PID)
+}
+
+func killAllRegisteredProcesses(registryPath string) {
+	reg, err := loadRegistry(registryPath)
+	if err != nil {
+		log.Printf("[CP] warning: failed to read registry for cleanup: %v", err)
+		return
+	}
+	if len(reg.Processes) == 0 {
+		_ = os.Remove(registryPath)
+		return
+	}
+
+	for nodeID, info := range reg.Processes {
+		proc, err := os.FindProcess(info.PID)
+		if err != nil {
+			continue
+		}
+		if err := proc.Kill(); err != nil {
+			// Best-effort: process may have already exited.
+			continue
+		}
+		log.Printf("[CP] cleaned up node %s (PID=%d)", nodeID, info.PID)
+	}
+
+	// Remove registry file at the end so next run starts clean.
+	_ = os.Remove(registryPath)
+}
+
+func parseListenAddress(input string) (host string, port int, normalized string, err error) {
+	if input == "" {
+		return "", 0, "", fmt.Errorf("empty address")
+	}
+
+	// Allow passing just a port for convenience.
+	if !strings.Contains(input, ":") {
+		p, perr := strconv.Atoi(input)
+		if perr != nil {
+			return "", 0, "", fmt.Errorf("invalid port/address %q", input)
+		}
+		return "localhost", p, fmt.Sprintf("localhost:%d", p), nil
+	}
+
+	h, pStr, splitErr := net.SplitHostPort(input)
+	if splitErr != nil {
+		return "", 0, "", fmt.Errorf("invalid address %q (expected host:port)", input)
+	}
+	p, perr := strconv.Atoi(pStr)
+	if perr != nil {
+		return "", 0, "", fmt.Errorf("invalid port in %q", input)
+	}
+	if h == "" {
+		h = "localhost"
+	}
+	return h, p, fmt.Sprintf("%s:%d", h, p), nil
+}
+
+func printChain(label string, head *pb.NodeInfo, tail *pb.NodeInfo, chain []*pb.NodeInfo) {
+	fmt.Printf("%s\n", label)
+	fmt.Printf("  head: %s (%s)\n", head.GetNodeId(), head.GetAddress())
+	fmt.Printf("  tail: %s (%s)\n", tail.GetNodeId(), tail.GetAddress())
+	fmt.Printf("  chain (%d):\n", len(chain))
+	for i, n := range chain {
+		fmt.Printf("    %d) %s (%s)\n", i+1, n.GetNodeId(), n.GetAddress())
+	}
+}
+
+func addServerToLocalControlPlane(cp *controlPlaneServer, nodeID, nodeAddr, controlAddr, serverBin, secret, registryPath string, launch bool, startWait time.Duration) int {
+	host, port, normalizedAddr, err := parseListenAddress(nodeAddr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		return 2
+	}
+	// The current server implementation binds to localhost:<port>.
+	if host != "localhost" && host != "127.0.0.1" {
+		fmt.Fprintf(os.Stderr, "for this demo, addr host must be localhost/127.0.0.1 (got %q)\n", host)
+		return 2
+	}
+
+	var startedCmd *exec.Cmd
+	if launch {
+		cmd := exec.Command(
+			serverBin,
+			"-n", nodeID,
+			"-a", fmt.Sprintf("%d", port),
+			"-c", controlAddr,
+			"-secret", secret,
+		)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to start server process: %v\n", err)
+			return 1
+		}
+		startedCmd = cmd
+		registerProcess(registryPath, nodeID, normalizedAddr, cmd.Process.Pid)
+		fmt.Printf("Started server process PID=%d for %s on %s\n", cmd.Process.Pid, nodeID, normalizedAddr)
+		time.Sleep(startWait)
+	}
+
+	resp, err := cp.Join(context.Background(), &pb.JoinRequest{NodeId: nodeID, Address: normalizedAddr})
+	if err != nil {
+		if startedCmd != nil && startedCmd.Process != nil {
+			_ = startedCmd.Process.Kill()
+			unregisterProcess(registryPath, nodeID)
+		}
+		fmt.Fprintf(os.Stderr, "Join failed: %v\n", err)
+		return 1
+	}
+	printChain("Added server to chain.", resp.GetHead(), resp.GetTail(), resp.GetChain())
+	return 0
+}
+
+func dropServerFromLocalControlPlane(cp *controlPlaneServer, nodeID, registryPath string, killLocal bool) int {
+	if killLocal {
+		_, msg := killRegisteredProcess(registryPath, nodeID)
+		fmt.Printf("Local process: %s\n", msg)
+	}
+	resp, err := cp.Leave(context.Background(), &pb.LeaveRequest{NodeId: nodeID})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Leave failed: %v\n", err)
+		return 1
+	}
+	printChain("Dropped server from chain.", resp.GetHead(), resp.GetTail(), resp.GetChain())
+	time.Sleep(500 * time.Millisecond)
+	return 0
+}
+
+func printReplHelp() {
+	fmt.Println("Commands:")
+	fmt.Println("  help                         Show this help")
+	fmt.Println("  state                        Print current chain state")
+	fmt.Println("  add <nodeId> <port|host:port> [--no-launch]")
+	fmt.Println("  drop <nodeId>                Drop from chain + kill local process")
+	fmt.Println("  drop <nodeId> --no-kill      Drop from chain without killing")
+	fmt.Println("  exit | quit                  Stop control panel")
+}
+
+func runRepl(cp *controlPlaneServer, controlAddr, serverBin, secret, registryPath string, startWait time.Duration, stop func()) {
+	scanner := bufio.NewScanner(os.Stdin)
+	fmt.Println("Control panel REPL ready. Type 'help' for commands.")
+	for {
+		fmt.Print("cp> ")
+		if !scanner.Scan() {
+			// stdin closed (or error) -> exit gracefully
+			stop()
+			return
+		}
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		cmd := strings.ToLower(fields[0])
+		switch cmd {
+		case "help", "?":
+			printReplHelp()
+		case "state":
+			resp, err := cp.GetClusterState(context.Background(), &emptypb.Empty{})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "GetClusterState failed: %v\n", err)
+				continue
+			}
+			printChain("Cluster state:", resp.GetHead(), resp.GetTail(), resp.GetChain())
+		case "add":
+			if len(fields) < 3 {
+				fmt.Fprintln(os.Stderr, "usage: add <nodeId> <port|host:port> [--no-launch]")
+				continue
+			}
+			nodeID := fields[1]
+			nodeAddr := fields[2]
+			launch := true
+			for _, f := range fields[3:] {
+				if f == "--no-launch" {
+					launch = false
+				}
+			}
+			_ = addServerToLocalControlPlane(cp, nodeID, nodeAddr, controlAddr, serverBin, secret, registryPath, launch, startWait)
+		case "drop", "remove":
+			if len(fields) < 2 {
+				fmt.Fprintln(os.Stderr, "usage: drop <nodeId> [--no-kill]")
+				continue
+			}
+			nodeID := fields[1]
+			killLocal := true
+			for _, f := range fields[2:] {
+				if f == "--no-kill" {
+					killLocal = false
+				}
+			}
+			_ = dropServerFromLocalControlPlane(cp, nodeID, registryPath, killLocal)
+		case "exit", "quit":
+			stop()
+			return
+		default:
+			fmt.Fprintf(os.Stderr, "unknown command: %s (type 'help')\n", fields[0])
+		}
+	}
 }
 
 type nodeStatus struct {
@@ -356,7 +667,7 @@ func (c *controlPlaneServer) pushChainToNode(addr string, nodes []*pb.NodeInfo) 
 // Optional launcher: start data-plane nodes as OS processes
 ////////////////////////////////////////////////////////////////////////////////
 
-func startServers(numServers int, headPort int, controlAddr string, secret string, serverBinary string) []*ServerProcess {
+func startServers(numServers int, headPort int, controlAddr string, secret string, serverBinary string, registryPath string) []*ServerProcess {
 	servers := make([]*ServerProcess, 0, numServers)
 	for i := 0; i < numServers; i++ {
 		nodeID := fmt.Sprintf("node-%d", i+1)
@@ -386,6 +697,9 @@ func startServers(numServers int, headPort int, controlAddr string, secret strin
 			log.Printf("Failed to start %s: %v", nodeID, err)
 			continue
 		}
+		if cmd.Process != nil {
+			registerProcess(registryPath, nodeID, address, cmd.Process.Pid)
+		}
 
 		servers = append(servers, &ServerProcess{
 			NodeID:  nodeID,
@@ -409,6 +723,19 @@ func main() {
 	// launcher options
 	launch := flag.Bool("launch", false, "also launch data-plane servers as OS processes")
 	serverBin := flag.String("serverbin", "../server/server.exe", "path to server binary (used only with -launch)")
+	registryPath := flag.String("registry", defaultRegistryPath(), "path to local process registry (for drop-server kill)")
+	startWait := flag.Duration("start-wait", 600*time.Millisecond, "delay after starting a server before Join (REPL add)")
+
+	flag.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage:")
+		fmt.Fprintln(os.Stderr, "  control-panel [flags]")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "Starts the control plane and opens an interactive REPL on stdin.")
+		fmt.Fprintln(os.Stderr, "REPL commands: help, state, add <nodeId> <port|host:port>, drop <nodeId>, exit")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "Flags:")
+		flag.PrintDefaults()
+	}
 
 	flag.Parse()
 
@@ -432,9 +759,15 @@ func main() {
 		}
 	}()
 
+	stopChan := make(chan struct{})
+	stopOnce := sync.Once{}
+	stop := func() {
+		stopOnce.Do(func() { close(stopChan) })
+	}
+
 	var servers []*ServerProcess
 	if *launch {
-		servers = startServers(*numServers, *headPort, controlAddr, *secret, *serverBin)
+		servers = startServers(*numServers, *headPort, controlAddr, *secret, *serverBin, *registryPath)
 		if len(servers) == 0 {
 			log.Fatal("No servers started")
 		}
@@ -443,11 +776,20 @@ func main() {
 		log.Println("Control plane running. (Use -launch to start data-plane nodes automatically.)")
 	}
 
+	// REPL runs in the same terminal (stdin). It can stop the server via stop().
+	go runRepl(cp, controlAddr, *serverBin, *secret, *registryPath, *startWait, stop)
+
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	<-sigChan
+	select {
+	case <-sigChan:
+	case <-stopChan:
+	}
 
 	log.Println("Shutting down control plane...")
+	// Clean up any nodes started via REPL or -launch.
+	killAllRegisteredProcesses(*registryPath)
+	grpcServer.GracefulStop()
 
 	if *launch {
 		log.Println("Shutting down servers...")

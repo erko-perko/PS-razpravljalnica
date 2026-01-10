@@ -234,7 +234,7 @@ func main() {
 				subDone <- struct{}{}
 				return
 			}
-			recvEvents("janez", stream, 6, subDone)
+			recvEvents("janez", stream, 0, subDone)
 		}()
 	}
 
@@ -407,7 +407,7 @@ func main() {
 				subDone <- struct{}{}
 				return
 			}
-			recvEvents("Miha", stream, 6, subDone)
+			recvEvents("Miha", stream, 0, subDone)
 		}()
 	}
 
