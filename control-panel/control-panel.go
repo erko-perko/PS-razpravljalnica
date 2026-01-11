@@ -26,7 +26,6 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
-// ServerProcess tracks a running server process (optional launcher)
 type ServerProcess struct {
 	NodeID  string
 	Address string
@@ -45,11 +44,14 @@ type processRegistry struct {
 	Processes map[string]processInfo `json:"processes"`
 }
 
+// defaultRegistryPath vrne privzeto pot do JSON datoteke, v katero lokalno shranjujemo PID-e zagnanih node-ov.
+// Namen je, da jih ob izhodu ali ob ukazu "drop" lahko najdemo in ubijemo (cleanup).
 func defaultRegistryPath() string {
-	// Keep it local and obvious for demo purposes.
 	return "control-panel.processes.json"
 }
 
+// loadRegistry prebere registry JSON iz diska in ga pretvori v strukturo processRegistry.
+// Če datoteka ne obstaja ali je prazna, vrne prazen registry z inicializiranimi mapami, da kasnejše operacije ne padejo.
 func loadRegistry(path string) (processRegistry, error) {
 	reg := processRegistry{Version: 1, Processes: map[string]processInfo{}}
 	data, err := os.ReadFile(path)
@@ -74,6 +76,8 @@ func loadRegistry(path string) (processRegistry, error) {
 	return reg, nil
 }
 
+// saveRegistry varno zapiše processRegistry v JSON datoteko (write-to-temp + rename).
+// To zmanjša možnost, da bi v primeru crasha ostala delno zapisana datoteka, in ohrani registry konsistenten.
 func saveRegistry(path string, reg processRegistry) error {
 	if reg.Version == 0 {
 		reg.Version = 1
@@ -87,17 +91,17 @@ func saveRegistry(path string, reg processRegistry) error {
 	}
 	tmp := path + ".tmp"
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		// if path has no dir component (relative file), Dir() returns "." and MkdirAll is fine
 		return err
 	}
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return err
 	}
-	// Windows can't replace existing file with Rename reliably; remove first.
 	_ = os.Remove(path)
 	return os.Rename(tmp, path)
 }
 
+// registerProcess doda ali posodobi zapis za nodeID v registryju (PID + naslov + timestamp zagona).
+// Uporablja se, ko CP lokalno zažene data-plane proces, da ga lahko kasneje zanesljivo ubije.
 func registerProcess(registryPath, nodeID, address string, pid int) {
 	reg, err := loadRegistry(registryPath)
 	if err != nil {
@@ -110,6 +114,8 @@ func registerProcess(registryPath, nodeID, address string, pid int) {
 	}
 }
 
+// unregisterProcess odstrani zapis o procesu iz registryja za dani nodeID.
+// To se kliče po uspešnem kill-u ali ko ugotovimo, da proces ne obstaja več in želimo pospraviti stanje.
 func unregisterProcess(registryPath, nodeID string) {
 	reg, err := loadRegistry(registryPath)
 	if err != nil {
@@ -119,6 +125,8 @@ func unregisterProcess(registryPath, nodeID string) {
 	_ = saveRegistry(registryPath, reg)
 }
 
+// killRegisteredProcess poskusi ubiti proces, ki je bil prej registriran za nodeID, in potem počisti registry.
+// Vrne status (killed) in opisno sporočilo, da lahko REPL uporabniku jasno pove, kaj se je zgodilo.
 func killRegisteredProcess(registryPath, nodeID string) (killed bool, msg string) {
 	reg, err := loadRegistry(registryPath)
 	if err != nil {
@@ -134,7 +142,6 @@ func killRegisteredProcess(registryPath, nodeID string) (killed bool, msg string
 		return false, fmt.Sprintf("failed to find process PID=%d (removed from registry)", info.PID)
 	}
 	if err := proc.Kill(); err != nil {
-		// On Windows, Kill may fail if already exited; treat that as non-fatal and cleanup registry.
 		unregisterProcess(registryPath, nodeID)
 		return false, fmt.Sprintf("failed to kill PID=%d (removed from registry anyway): %v", info.PID, err)
 	}
@@ -142,6 +149,8 @@ func killRegisteredProcess(registryPath, nodeID string) (killed bool, msg string
 	return true, fmt.Sprintf("killed PID=%d", info.PID)
 }
 
+// killAllRegisteredProcesses pobere vse node-e iz registryja in jih best-effort ubije.
+// Na koncu odstrani registry datoteko, da naslednji zagon kontrolnega panela začne s čistim stanjem.
 func killAllRegisteredProcesses(registryPath string) {
 	reg, err := loadRegistry(registryPath)
 	if err != nil {
@@ -159,22 +168,21 @@ func killAllRegisteredProcesses(registryPath string) {
 			continue
 		}
 		if err := proc.Kill(); err != nil {
-			// Best-effort: process may have already exited.
 			continue
 		}
 		log.Printf("[CP] cleaned up node %s (PID=%d)", nodeID, info.PID)
 	}
 
-	// Remove registry file at the end so next run starts clean.
 	_ = os.Remove(registryPath)
 }
 
+// parseListenAddress normalizira uporabnikov vnos naslova (port ali host:port) v obliko host, port in "host:port" string.
+// Poleg validacije (npr. port je številka) poskrbi, da prazen host privzeto postane "localhost".
 func parseListenAddress(input string) (host string, port int, normalized string, err error) {
 	if input == "" {
 		return "", 0, "", fmt.Errorf("empty address")
 	}
 
-	// Allow passing just a port for convenience.
 	if !strings.Contains(input, ":") {
 		p, perr := strconv.Atoi(input)
 		if perr != nil {
@@ -197,6 +205,8 @@ func parseListenAddress(input string) (host string, port int, normalized string,
 	return h, p, fmt.Sprintf("%s:%d", h, p), nil
 }
 
+// printChain izpiše trenutno stanje verige: kdo je head, kdo je tail in kateri node-i so v chain-u po vrstnem redu.
+// Uporablja se v REPL ukazih (state/add/drop), da ima uporabnik hiter pregled nad topologijo.
 func printChain(label string, head *pb.NodeInfo, tail *pb.NodeInfo, chain []*pb.NodeInfo) {
 	fmt.Printf("%s\n", label)
 	fmt.Printf("  head: %s (%s)\n", head.GetNodeId(), head.GetAddress())
@@ -207,13 +217,14 @@ func printChain(label string, head *pb.NodeInfo, tail *pb.NodeInfo, chain []*pb.
 	}
 }
 
+// addServerToLocalControlPlane po potrebi lokalno zažene data-plane proces (server.exe) in ga nato registrira v control plane (Join).
+// Če Join ne uspe, best-effort ubije pravkar zagnan proces in počisti registry, da ne ostane "ghost" proces v ozadju.
 func addServerToLocalControlPlane(cp *controlPlaneServer, nodeID, nodeAddr, controlAddr, serverBin, secret, registryPath string, launch bool, startWait time.Duration) int {
 	host, port, normalizedAddr, err := parseListenAddress(nodeAddr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		return 2
 	}
-	// The current server implementation binds to localhost:<port>.
 	if host != "localhost" && host != "127.0.0.1" {
 		fmt.Fprintf(os.Stderr, "for this demo, addr host must be localhost/127.0.0.1 (got %q)\n", host)
 		return 2
@@ -253,6 +264,8 @@ func addServerToLocalControlPlane(cp *controlPlaneServer, nodeID, nodeAddr, cont
 	return 0
 }
 
+// dropServerFromLocalControlPlane odstrani node iz verige (Leave) in opcijsko ubije tudi lokalni proces, če je bil zagnan prek CP.
+// Po spremembi verige počaka kratek čas, da se konfiguracija razširi, nato pa vrne rezultat ukaza REPL.
 func dropServerFromLocalControlPlane(cp *controlPlaneServer, nodeID, registryPath string, killLocal bool) int {
 	if killLocal {
 		_, msg := killRegisteredProcess(registryPath, nodeID)
@@ -268,6 +281,8 @@ func dropServerFromLocalControlPlane(cp *controlPlaneServer, nodeID, registryPat
 	return 0
 }
 
+// printReplHelp izpiše seznam podprtih REPL ukazov in kratko razlago njihove uporabe.
+// S tem uporabniku omogoča, da brez branja kode hitro vidi, kako upravljati verigo.
 func printReplHelp() {
 	fmt.Println("Commands:")
 	fmt.Println("  help                         Show this help")
@@ -278,13 +293,14 @@ func printReplHelp() {
 	fmt.Println("  exit | quit                  Stop control panel")
 }
 
+// runRepl izvaja interaktivno zanko, ki bere ukaze iz stdin in kliče ustrezne metode control-plane strežnika.
+// Podpira ogled stanja (state), dodajanje node-a (add) in odstranjevanje node-a (drop), ter omogoča urejen izhod prek stop().
 func runRepl(cp *controlPlaneServer, controlAddr, serverBin, secret, registryPath string, startWait time.Duration, stop func()) {
 	scanner := bufio.NewScanner(os.Stdin)
 	fmt.Println("Control panel REPL ready. Type 'help' for commands.")
 	for {
 		fmt.Print("cp> ")
 		if !scanner.Scan() {
-			// stdin closed (or error) -> exit gracefully
 			stop()
 			return
 		}
@@ -353,13 +369,14 @@ type controlPlaneServer struct {
 
 	lock sync.Mutex
 
-	// ordered chain head->tail
 	chain []*pb.NodeInfo
 	nodes map[string]*nodeStatus
 
 	heartbeatTimeout time.Duration
 }
 
+// newControlPlane inicializira control-plane stanje: prazno verigo, mapo node-ov in timeout za heartbeat failure detection.
+// Vse spremembe stanja so kasneje zaščitene z mutexom, da so RPC-ji varni za sočasno izvajanje.
 func newControlPlane(timeout time.Duration) *controlPlaneServer {
 	return &controlPlaneServer{
 		chain:            make([]*pb.NodeInfo, 0),
@@ -368,6 +385,8 @@ func newControlPlane(timeout time.Duration) *controlPlaneServer {
 	}
 }
 
+// cloneNodeInfo naredi plitvo kopijo NodeInfo, da ne vračamo ali delimo mutable pointerjev iz notranjega stanja.
+// To zmanjša možnost race conditionov, ko se chain posodablja, medtem ko drug goroutine bere podatke za response.
 func cloneNodeInfo(n *pb.NodeInfo) *pb.NodeInfo {
 	if n == nil {
 		return nil
@@ -375,6 +394,8 @@ func cloneNodeInfo(n *pb.NodeInfo) *pb.NodeInfo {
 	return &pb.NodeInfo{NodeId: n.GetNodeId(), Address: n.GetAddress()}
 }
 
+// GetClusterState vrne trenutni snapshot verige: head, tail in celoten seznam node-ov po vrstnem redu.
+// Odgovor vedno vsebuje kopije NodeInfo, da klient ali REPL ne more nenamerno spreminjati notranjega stanja CP.
 func (c *controlPlaneServer) GetClusterState(ctx context.Context, _ *emptypb.Empty) (*pb.GetClusterStateResponse, error) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
@@ -391,10 +412,11 @@ func (c *controlPlaneServer) GetClusterState(ctx context.Context, _ *emptypb.Emp
 	}, nil
 }
 
+// ConfigureChain omogoča, da CP ročno nastavi verigo na seznam node-ov iz requesta.
+// Po posodobitvi stanja v ozadju sproži pushChainToAll, da vsi data-plane node-i dobijo novo topologijo prek ConfigureChain RPC-ja.
 func (c *controlPlaneServer) ConfigureChain(ctx context.Context, req *pb.ConfigureChainRequest) (*emptypb.Empty, error) {
 	c.lock.Lock()
 	c.chain = append([]*pb.NodeInfo(nil), req.GetNodes()...)
-	// also ensure nodes map contains these nodes
 	for _, n := range c.chain {
 		if _, ok := c.nodes[n.GetNodeId()]; !ok {
 			c.nodes[n.GetNodeId()] = &nodeStatus{
@@ -411,6 +433,8 @@ func (c *controlPlaneServer) ConfigureChain(ctx context.Context, req *pb.Configu
 	return &emptypb.Empty{}, nil
 }
 
+// GetLeastLoadedNode izbere "najmanj obremenjen" node glede na subCount, pri čemer upošteva samo node-e, ki so alive in v chain vrstnem redu.
+// To se uporablja za load-balancing subscription streamov, da se naročnine porazdelijo in ne obremenjujejo enega samega node-a.
 func (c *controlPlaneServer) GetLeastLoadedNode(ctx context.Context, _ *emptypb.Empty) (*pb.NodeInfo, error) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
@@ -418,7 +442,6 @@ func (c *controlPlaneServer) GetLeastLoadedNode(ctx context.Context, _ *emptypb.
 	var best *pb.NodeInfo
 	var bestCount int64 = -1
 
-	// izbiraj samo po chain vrstnem redu in samo alive node-e
 	for _, n := range c.chain {
 		st, ok := c.nodes[n.GetNodeId()]
 		if !ok || !st.alive {
@@ -433,17 +456,17 @@ func (c *controlPlaneServer) GetLeastLoadedNode(ctx context.Context, _ *emptypb.
 	if best == nil {
 		return &pb.NodeInfo{NodeId: "none", Address: ""}, nil
 	}
-	// vrni kopijo, da ne deliš pointerja
 	return &pb.NodeInfo{NodeId: best.GetNodeId(), Address: best.GetAddress()}, nil
 }
 
+// Heartbeat posodobi status node-a (alive, lastHeartbeat, lastApplied, subCount) in ga po potrebi doda v verigo.
+// Če je to prvič, da CP vidi node (npr. node pošlje heartbeat pred Join), se node avtomatsko doda in topologija se nato razpošlje vsem.
 func (c *controlPlaneServer) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
 	var changed bool
 
 	c.lock.Lock()
 	st, ok := c.nodes[req.GetNodeId()]
 	if !ok {
-		// auto-join on first heartbeat if not joined
 		info := &pb.NodeInfo{NodeId: req.GetNodeId(), Address: req.GetAddress()}
 		st = &nodeStatus{
 			info:          info,
@@ -454,24 +477,17 @@ func (c *controlPlaneServer) Heartbeat(ctx context.Context, req *pb.HeartbeatReq
 		}
 		st.subCount = req.GetSubCount()
 		c.nodes[req.GetNodeId()] = st
-
-		// join at tail, but avoid duplicates
 		changed = c.appendToChainIfMissing(info)
 	} else {
-		// normal heartbeat update
 		st.info.Address = req.GetAddress()
 		st.lastHeartbeat = time.Now()
 		st.lastApplied = req.GetLastAppliedSeq()
 		st.subCount = req.GetSubCount()
 		if !st.alive {
 			st.alive = true
-
-			// node was previously removed from chain by failure monitor -> re-add at tail if missing
 			if c.appendToChainIfMissing(st.info) {
 				changed = true
 			} else {
-				// even if already present, topology might have changed recently;
-				// not strictly required, but safer to re-push when a node revives
 				changed = true
 			}
 		} else {
@@ -486,6 +502,8 @@ func (c *controlPlaneServer) Heartbeat(ctx context.Context, req *pb.HeartbeatReq
 	return &pb.HeartbeatResponse{Ok: true}, nil
 }
 
+// Join registrira node v CP (ali posodobi njegove podatke) in poskrbi, da je node prisoten v verigi brez duplikatov.
+// Če se topologija spremeni, CP asinhrono potisne novo verigo vsem živim node-om, da se uskladijo head/tail/pred/succ.
 func (c *controlPlaneServer) Join(ctx context.Context, req *pb.JoinRequest) (*pb.JoinResponse, error) {
 	var changed bool
 
@@ -502,13 +520,11 @@ func (c *controlPlaneServer) Join(ctx context.Context, req *pb.JoinRequest) (*pb
 		changed = c.appendToChainIfMissing(info)
 		st = c.nodes[req.GetNodeId()]
 	} else {
-		// already known (maybe via heartbeat auto-join) -> just update
 		st.info.Address = req.GetAddress()
 		st.lastHeartbeat = time.Now()
 		if !st.alive {
 			st.alive = true
 		}
-		// ensure it's in chain (avoid duplicates)
 		changed = c.appendToChainIfMissing(st.info)
 	}
 
@@ -523,9 +539,12 @@ func (c *controlPlaneServer) Join(ctx context.Context, req *pb.JoinRequest) (*pb
 	if changed {
 		go c.pushChainToAll()
 	}
+	_ = st
 	return resp, nil
 }
 
+// Leave odstrani node iz CP evidence in ga odstrani tudi iz verige, če je bil prisoten.
+// Po odstranitvi CP razpošlje novo topologijo vsem živim node-om, da se veriga stabilizira in se izračunajo novi head/tail.
 func (c *controlPlaneServer) Leave(ctx context.Context, req *pb.LeaveRequest) (*pb.LeaveResponse, error) {
 	c.lock.Lock()
 	_, ok := c.nodes[req.GetNodeId()]
@@ -544,6 +563,8 @@ func (c *controlPlaneServer) Leave(ctx context.Context, req *pb.LeaveRequest) (*
 	return &pb.LeaveResponse{Head: head, Tail: tail, Chain: chain}, nil
 }
 
+// getHeadTailLocked vrne head in tail iz trenutne verige; kliče se samo pod mutexom.
+// Če je veriga prazna, vrne sentinel vrednosti ("none"), da se klienti lahko temu prilagodijo.
 func (c *controlPlaneServer) getHeadTailLocked() (*pb.NodeInfo, *pb.NodeInfo) {
 	if len(c.chain) == 0 {
 		return &pb.NodeInfo{NodeId: "none", Address: ""}, &pb.NodeInfo{NodeId: "none", Address: ""}
@@ -551,6 +572,8 @@ func (c *controlPlaneServer) getHeadTailLocked() (*pb.NodeInfo, *pb.NodeInfo) {
 	return cloneNodeInfo(c.chain[0]), cloneNodeInfo(c.chain[len(c.chain)-1])
 }
 
+// filterChain vrne novo verigo brez node-a z danim nodeID, pri čemer ohrani prvotni vrstni red.
+// Uporablja se pri Leave in pri failure detectionu, ko CP odstrani node iz topologije.
 func filterChain(chain []*pb.NodeInfo, nodeID string) []*pb.NodeInfo {
 	out := make([]*pb.NodeInfo, 0, len(chain))
 	for _, n := range chain {
@@ -561,6 +584,8 @@ func filterChain(chain []*pb.NodeInfo, nodeID string) []*pb.NodeInfo {
 	return out
 }
 
+// inChain preveri, ali se nodeID že pojavi v trenutni verigi.
+// To preprečuje duplikate, ko node pošlje Join/Heartbeat večkrat ali se ponovno oživi.
 func (c *controlPlaneServer) inChain(nodeID string) bool {
 	for _, n := range c.chain {
 		if n.GetNodeId() == nodeID {
@@ -570,6 +595,8 @@ func (c *controlPlaneServer) inChain(nodeID string) bool {
 	return false
 }
 
+// appendToChainIfMissing doda node v verigo samo, če še ni prisoten, in vrne ali je prišlo do spremembe.
+// CP node-e tipično dodaja na konec (tail), kar poenostavi rast verige in re-konfiguracije.
 func (c *controlPlaneServer) appendToChainIfMissing(info *pb.NodeInfo) bool {
 	if c.inChain(info.GetNodeId()) {
 		return false
@@ -578,6 +605,8 @@ func (c *controlPlaneServer) appendToChainIfMissing(info *pb.NodeInfo) bool {
 	return true
 }
 
+// monitorFailuresLoop periodično preverja, ali so node-i zamudili heartbeat preko heartbeatTimeout.
+// Ko node označi kot mrtev, ga odstrani iz aktivne verige (ohrani vrstni red živih) in sproži push nove topologije.
 func (c *controlPlaneServer) monitorFailuresLoop(ctx context.Context) {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
@@ -601,7 +630,6 @@ func (c *controlPlaneServer) monitorFailuresLoop(ctx context.Context) {
 		}
 
 		if changed {
-			// rebuild chain from alive nodes in existing order
 			newChain := make([]*pb.NodeInfo, 0, len(c.chain))
 			for _, n := range c.chain {
 				st, ok := c.nodes[n.GetNodeId()]
@@ -619,9 +647,10 @@ func (c *controlPlaneServer) monitorFailuresLoop(ctx context.Context) {
 	}
 }
 
+// pushChainToAll pripravi snapshot trenutne verige in ga pošlje vsem živim node-om preko ConfigureChain RPC-ja.
+// Snapshotiranje pod lockom prepreči, da bi goroutine-i delili pointerje, ki se medtem spreminjajo.
 func (c *controlPlaneServer) pushChainToAll() {
 	c.lock.Lock()
-	// Build snapshots under lock so we don't share mutable *pb.NodeInfo across goroutines.
 	nodes := make([]*pb.NodeInfo, 0, len(c.chain))
 	for _, n := range c.chain {
 		nodes = append(nodes, cloneNodeInfo(n))
@@ -639,11 +668,12 @@ func (c *controlPlaneServer) pushChainToAll() {
 	}
 }
 
+// pushChainToNode poskuša poslati novo topologijo na en data-plane node z omejenim številom retry-jev.
+// To ublaži napake (npr. node se ravno zaganja), brez potrebe po stalnem "spam" pushanju konfiguracije.
 func (c *controlPlaneServer) pushChainToNode(addr string, nodes []*pb.NodeInfo) {
 	if addr == "" {
 		return
 	}
-	// Bounded retries: helps with transient dial/startup races without needing periodic pushes.
 	for attempt := 1; attempt <= 3; attempt++ {
 		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
@@ -663,10 +693,8 @@ func (c *controlPlaneServer) pushChainToNode(addr string, nodes []*pb.NodeInfo) 
 	}
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Optional launcher: start data-plane nodes as OS processes
-////////////////////////////////////////////////////////////////////////////////
-
+// startServers lokalno zažene več data-plane server procesov in jih zapiše v registry za kasnejši cleanup.
+// Namenjeno je demo načinu (-launch), da lahko z enim ukazom dobiš celo verigo node-ov brez ročnega zaganjanja.
 func startServers(numServers int, headPort int, controlAddr string, secret string, serverBinary string, registryPath string) []*ServerProcess {
 	servers := make([]*ServerProcess, 0, numServers)
 	for i := 0; i < numServers; i++ {
@@ -686,11 +714,7 @@ func startServers(numServers int, headPort int, controlAddr string, secret strin
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 
-		// Keep it portable: do not use Windows-only flags on non-Windows.
-		// If you really need process-group semantics on Windows, use a separate build tag file.
 		if runtime.GOOS == "windows" {
-			// best-effort: still avoid referencing windows-only constants here
-			// (no-op)
 		}
 
 		if err := cmd.Start(); err != nil {
@@ -707,12 +731,14 @@ func startServers(numServers int, headPort int, controlAddr string, secret strin
 			Port:    port,
 			Cmd:     cmd,
 		})
-		time.Sleep(500 * time.Millisecond) // small delay
+		time.Sleep(500 * time.Millisecond)
 		log.Printf("Started %s (PID=%d)", nodeID, cmd.Process.Pid)
 	}
 	return servers
 }
 
+// main zažene gRPC ControlPlane strežnik, starta failure monitor in odpre REPL za interaktivno upravljanje verige.
+// Ob izhodu iz programa naredi cleanup: ubije lokalno zagnane node procese (če obstajajo) in ustavi gRPC server.
 func main() {
 	numServers := flag.Int("n", 3, "number of servers in the chain")
 	headPort := flag.Int("p", 50051, "head server port")
@@ -720,7 +746,6 @@ func main() {
 	timeoutMs := flag.Int("to", 2000, "heartbeat timeout (ms)")
 	secret := flag.String("secret", "dev-secret-change-me", "token signing secret (must match servers)")
 
-	// launcher options
 	launch := flag.Bool("launch", false, "also launch data-plane servers as OS processes")
 	serverBin := flag.String("serverbin", "../server/server.exe", "path to server binary (used only with -launch)")
 	registryPath := flag.String("registry", defaultRegistryPath(), "path to local process registry (for drop-server kill)")
@@ -776,7 +801,6 @@ func main() {
 		log.Println("Control plane running. (Use -launch to start data-plane nodes automatically.)")
 	}
 
-	// REPL runs in the same terminal (stdin). It can stop the server via stop().
 	go runRepl(cp, controlAddr, *serverBin, *secret, *registryPath, *startWait, stop)
 
 	sigChan := make(chan os.Signal, 1)
@@ -787,7 +811,6 @@ func main() {
 	}
 
 	log.Println("Shutting down control plane...")
-	// Clean up any nodes started via REPL or -launch.
 	killAllRegisteredProcesses(*registryPath)
 	grpcServer.GracefulStop()
 

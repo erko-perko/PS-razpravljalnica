@@ -24,12 +24,9 @@ func eventually(t *testing.T, timeout time.Duration, cond func() bool) {
 	}
 }
 
-// NOTE: These are unit tests for the control plane's state management logic.
-// The control plane does NOT start server processes - it only tracks metadata
-// about servers that register themselves via Join/Heartbeat.
-// Real servers must be started externally (manually, via -launch flag, or by orchestrator).
-
-// Test newControlPlane creates a control plane with correct initial state
+// Test preveri, da newControlPlane pravilno inicializira vse notranje strukture.
+// Preveri timeout, prazno verigo in prazno mapo node-ov.
+// S tem potrdi, da je začetno stanje deterministično in pripravljeno na Join/Heartbeat.
 func TestNewControlPlane(t *testing.T) {
 	timeout := 2 * time.Second
 	cp := newControlPlane(timeout)
@@ -48,7 +45,9 @@ func TestNewControlPlane(t *testing.T) {
 	}
 }
 
-// Test GetClusterState with empty cluster
+// Test preveri, da GetClusterState na praznem clustru vrne "none" za head in tail.
+// Preveri tudi, da je vrnjena veriga prazna.
+// To je osnovni sanity check za prikaz stanja pred registracijo node-ov.
 func TestGetClusterStateEmpty(t *testing.T) {
 	cp := newControlPlane(2 * time.Second)
 	ctx := context.Background()
@@ -69,7 +68,9 @@ func TestGetClusterStateEmpty(t *testing.T) {
 	}
 }
 
-// Test GetClusterState with configured nodes (metadata only - servers not actually running)
+// Test preveri, da ConfigureChain pravilno nastavi verigo in da GetClusterState vrne isto topologijo.
+// To simulira “metadata-only” konfiguracijo, brez dejanskega poganjanja strežnikov.
+// Preveri pravilno določanje head in tail glede na vrstni red v chain.
 func TestGetClusterStateWithNodes(t *testing.T) {
 	cp := newControlPlane(2 * time.Second)
 	ctx := context.Background()
@@ -85,7 +86,6 @@ func TestGetClusterStateWithNodes(t *testing.T) {
 		t.Fatalf("ConfigureChain failed: %v", err)
 	}
 
-	// Give it a moment for goroutine to complete
 	time.Sleep(50 * time.Millisecond)
 
 	resp, err := cp.GetClusterState(ctx, &emptypb.Empty{})
@@ -104,7 +104,9 @@ func TestGetClusterStateWithNodes(t *testing.T) {
 	}
 }
 
-// Test ConfigureChain - only updates chain metadata, does NOT start servers
+// Test preveri, da ConfigureChain posodobi chain in nodes mapo, ne da bi node-e označil kot žive.
+// Ker ni bilo heartbeat-ov, morajo biti alive=false.
+// S tem se potrdi, da “konfiguracija” sama po sebi ne pomeni razpoložljivosti.
 func TestConfigureChain(t *testing.T) {
 	cp := newControlPlane(2 * time.Second)
 	ctx := context.Background()
@@ -127,7 +129,6 @@ func TestConfigureChain(t *testing.T) {
 	if len(cp.nodes) != 2 {
 		t.Errorf("expected nodes map size 2, got %d", len(cp.nodes))
 	}
-	// Note: nodes are marked as alive=false since no heartbeats received
 	for id, st := range cp.nodes {
 		if st.alive {
 			t.Errorf("node %s should be marked dead (no heartbeat yet)", id)
@@ -135,12 +136,13 @@ func TestConfigureChain(t *testing.T) {
 	}
 }
 
-// Test ConfigureChain can be called multiple times
+// Test preveri, da se ConfigureChain lahko kliče večkrat in da nova konfiguracija zamenja staro.
+// Najprej nastavi verigo z enim node-om, nato jo zamenja z dvema.
+// Preveri, da je vrstni red v chain enak novemu vhodu.
 func TestConfigureChainMultipleTimes(t *testing.T) {
 	cp := newControlPlane(2 * time.Second)
 	ctx := context.Background()
 
-	// First configuration
 	nodes1 := []*pb.NodeInfo{
 		{NodeId: "node-1", Address: "localhost:50051"},
 	}
@@ -151,7 +153,6 @@ func TestConfigureChainMultipleTimes(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// Second configuration (replaces)
 	nodes2 := []*pb.NodeInfo{
 		{NodeId: "node-2", Address: "localhost:50052"},
 		{NodeId: "node-3", Address: "localhost:50053"},
@@ -171,12 +172,13 @@ func TestConfigureChainMultipleTimes(t *testing.T) {
 	}
 }
 
-// Test Join functionality - simulates a running server registering itself with control plane
+// Test preveri, da Join registrira node, doda node v nodes mapo in ga vključi v chain.
+// To simulira delujoč strežnik, ki se prijavi na control plane.
+// Preveri tudi, da je JoinResponse skladen z internim stanjem.
 func TestJoin(t *testing.T) {
 	cp := newControlPlane(2 * time.Second)
 	ctx := context.Background()
 
-	// Simulate a server that's already running calling Join to register
 	req := &pb.JoinRequest{
 		NodeId:  "node-1",
 		Address: "localhost:50051",
@@ -201,12 +203,13 @@ func TestJoin(t *testing.T) {
 	}
 }
 
-// Test Join multiple nodes
+// Test preveri, da več zaporednih Join klicev sestavi chain v pravilnem vrstnem redu.
+// Najprej se pridruži node-1, nato node-2.
+// Na koncu mora chain vsebovati oba in ohraniti vrstni red dodajanja.
 func TestJoinMultipleNodes(t *testing.T) {
 	cp := newControlPlane(2 * time.Second)
 	ctx := context.Background()
 
-	// Join first node
 	_, err := cp.Join(ctx, &pb.JoinRequest{NodeId: "node-1", Address: "localhost:50051"})
 	if err != nil {
 		t.Fatalf("First Join failed: %v", err)
@@ -214,7 +217,6 @@ func TestJoinMultipleNodes(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// Join second node
 	_, err = cp.Join(ctx, &pb.JoinRequest{NodeId: "node-2", Address: "localhost:50052"})
 	if err != nil {
 		t.Fatalf("Second Join failed: %v", err)
@@ -233,12 +235,13 @@ func TestJoinMultipleNodes(t *testing.T) {
 	}
 }
 
-// Test Join prevents duplicate nodes
+// Test preveri, da Join ne ustvari duplikatov v chain.
+// Isti node se prijavi dvakrat z istimi podatki.
+// Na koncu mora chain ostati dolžine 1.
 func TestJoinDuplicateNode(t *testing.T) {
 	cp := newControlPlane(2 * time.Second)
 	ctx := context.Background()
 
-	// Join first time
 	_, err := cp.Join(ctx, &pb.JoinRequest{NodeId: "node-1", Address: "localhost:50051"})
 	if err != nil {
 		t.Fatalf("First Join failed: %v", err)
@@ -246,7 +249,6 @@ func TestJoinDuplicateNode(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// Join same node again
 	_, err = cp.Join(ctx, &pb.JoinRequest{NodeId: "node-1", Address: "localhost:50051"})
 	if err != nil {
 		t.Fatalf("Second Join failed: %v", err)
@@ -259,12 +261,13 @@ func TestJoinDuplicateNode(t *testing.T) {
 	}
 }
 
-// Test Leave functionality
+// Test preveri, da Leave odstrani node iz nodes mape in iz chain.
+// Najprej se node pridruži, nato se odstrani.
+// Preveri, da je stanje prazno in da tudi response vsebuje prazno verigo.
 func TestLeave(t *testing.T) {
 	cp := newControlPlane(2 * time.Second)
 	ctx := context.Background()
 
-	// Join a node first
 	_, err := cp.Join(ctx, &pb.JoinRequest{NodeId: "node-1", Address: "localhost:50051"})
 	if err != nil {
 		t.Fatalf("Join failed: %v", err)
@@ -272,7 +275,6 @@ func TestLeave(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// Leave
 	resp, err := cp.Leave(ctx, &pb.LeaveRequest{NodeId: "node-1"})
 	if err != nil {
 		t.Fatalf("Leave failed: %v", err)
@@ -291,7 +293,9 @@ func TestLeave(t *testing.T) {
 	}
 }
 
-// Test Leave non-existent node (should not error)
+// Test preveri, da Leave na neobstoječem node-u ne povzroči napake.
+// Klic se mora obnašati idempotentno in ohraniti prazno stanje.
+// To je pomembno za robustnost pri ponavljanju ukazov ali nekonsistentnih orchestratorjih.
 func TestLeaveNonExistentNode(t *testing.T) {
 	cp := newControlPlane(2 * time.Second)
 	ctx := context.Background()
@@ -306,12 +310,13 @@ func TestLeaveNonExistentNode(t *testing.T) {
 	}
 }
 
-// Test Heartbeat creates node status - simulates a running server sending heartbeat
+// Test preveri, da prvi Heartbeat ustvari nodeStatus, nastavi alive=true in auto-join v chain.
+// Preveri tudi, da se prenesejo metapodatki lastAppliedSeq in subCount.
+// S tem testom pokrijemo scenarij, ko se server nikoli eksplicitno ne Join-a.
 func TestHeartbeat(t *testing.T) {
 	cp := newControlPlane(2 * time.Second)
 	ctx := context.Background()
 
-	// Simulate a running server sending its first heartbeat (auto-join)
 	req := &pb.HeartbeatRequest{
 		NodeId:         "node-1",
 		Address:        "localhost:50051",
@@ -345,12 +350,13 @@ func TestHeartbeat(t *testing.T) {
 	}
 }
 
-// Test Heartbeat updates existing node
+// Test preveri, da Heartbeat na obstoječem node-u posodobi metapodatke.
+// Najprej pošlje heartbeat z začetnimi vrednostmi, nato heartbeat z novimi.
+// Na koncu mora nodes mapa vsebovati posodobljen lastAppliedSeq in subCount.
 func TestHeartbeatUpdate(t *testing.T) {
 	cp := newControlPlane(2 * time.Second)
 	ctx := context.Background()
 
-	// First heartbeat
 	req1 := &pb.HeartbeatRequest{
 		NodeId:         "node-1",
 		Address:        "localhost:50051",
@@ -364,7 +370,6 @@ func TestHeartbeatUpdate(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// Second heartbeat with updated values
 	req2 := &pb.HeartbeatRequest{
 		NodeId:         "node-1",
 		Address:        "localhost:50051",
@@ -385,7 +390,9 @@ func TestHeartbeatUpdate(t *testing.T) {
 	}
 }
 
-// Test GetLeastLoadedNode with empty cluster
+// Test preveri, da GetLeastLoadedNode na praznem clustru vrne "none".
+// To je pričakovano, ker ni nobenega alive node-a v chain.
+// Test varuje pred nil dereferencami in napačnimi defaulti.
 func TestGetLeastLoadedNodeEmpty(t *testing.T) {
 	cp := newControlPlane(2 * time.Second)
 	ctx := context.Background()
@@ -400,12 +407,13 @@ func TestGetLeastLoadedNodeEmpty(t *testing.T) {
 	}
 }
 
-// Test GetLeastLoadedNode with single node
+// Test preveri, da GetLeastLoadedNode pri enem alive node-u vrne ravno tega node-a.
+// Node se registrira prek Heartbeat, zato je alive=true.
+// To potrdi osnovno delovanje load-balancing izbire.
 func TestGetLeastLoadedNodeSingle(t *testing.T) {
 	cp := newControlPlane(2 * time.Second)
 	ctx := context.Background()
 
-	// Simulate a running server sending heartbeat to register
 	req := &pb.HeartbeatRequest{
 		NodeId:         "node-1",
 		Address:        "localhost:50051",
@@ -429,12 +437,13 @@ func TestGetLeastLoadedNodeSingle(t *testing.T) {
 	}
 }
 
-// Test GetLeastLoadedNode selects node with lowest subCount
+// Test preveri, da GetLeastLoadedNode izbere alive node z najmanjšim subCount.
+// Doda tri node-e prek Heartbeat z različnimi subCount vrednostmi.
+// Nato preveri, da je izbran node-2, ker ima najmanjšo obremenitev.
 func TestGetLeastLoadedNodeMultiple(t *testing.T) {
 	cp := newControlPlane(2 * time.Second)
 	ctx := context.Background()
 
-	// Add nodes with different sub counts
 	nodes := []struct {
 		id       string
 		subCount int64
@@ -469,12 +478,13 @@ func TestGetLeastLoadedNodeMultiple(t *testing.T) {
 	}
 }
 
-// Test GetLeastLoadedNode excludes dead nodes
+// Test preveri, da GetLeastLoadedNode ignorira dead node-e tudi če imajo nižji subCount.
+// Ustvari dva node-a in zažene monitorFailuresLoop, nato preneha osveževati node-1.
+// Pričakuje, da bo node-1 označen kot dead in da bo izbira padla na node-2.
 func TestGetLeastLoadedNodeExcludesDead(t *testing.T) {
 	cp := newControlPlane(100 * time.Millisecond)
 	ctx := context.Background()
 
-	// Add node-1 with low subCount
 	req1 := &pb.HeartbeatRequest{
 		NodeId:         "node-1",
 		Address:        "localhost:50051",
@@ -486,7 +496,6 @@ func TestGetLeastLoadedNodeExcludesDead(t *testing.T) {
 		t.Fatalf("Heartbeat failed: %v", err)
 	}
 
-	// Add node-2 with higher subCount
 	req2 := &pb.HeartbeatRequest{
 		NodeId:         "node-2",
 		Address:        "localhost:50052",
@@ -500,12 +509,10 @@ func TestGetLeastLoadedNodeExcludesDead(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// Start failure monitor
 	monitorCtx, monitorCancel := context.WithCancel(context.Background())
 	defer monitorCancel()
 	go cp.monitorFailuresLoop(monitorCtx)
 
-	// Keep node-2 alive while waiting for node-1 to be marked dead
 	keepAliveCtx, keepAliveCancel := context.WithCancel(context.Background())
 	defer keepAliveCancel()
 	go func() {
@@ -533,18 +540,18 @@ func TestGetLeastLoadedNodeExcludesDead(t *testing.T) {
 		t.Fatalf("GetLeastLoadedNode failed: %v", err)
 	}
 
-	// Should return node-2 even though it has higher subCount, because node-1 is dead
 	if resp.GetNodeId() != "node-2" {
 		t.Errorf("expected 'node-2' (node-1 is dead), got %s", resp.GetNodeId())
 	}
 }
 
-// Test failure monitor detects dead nodes
+// Test preveri, da monitorFailuresLoop zazna mrtve node-e in rebuilda chain brez njih.
+// Node se registrira prek Heartbeat, nato se monitor zažene in počaka na timeout.
+// Na koncu mora biti node označen dead in chain prazen.
 func TestMonitorFailuresDetectsDead(t *testing.T) {
 	cp := newControlPlane(200 * time.Millisecond)
 	ctx := context.Background()
 
-	// Add node
 	req := &pb.HeartbeatRequest{
 		NodeId:         "node-1",
 		Address:        "localhost:50051",
@@ -558,7 +565,6 @@ func TestMonitorFailuresDetectsDead(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// Start failure monitor
 	monitorCtx, monitorCancel := context.WithCancel(context.Background())
 	defer monitorCancel()
 	go cp.monitorFailuresLoop(monitorCtx)
@@ -571,12 +577,13 @@ func TestMonitorFailuresDetectsDead(t *testing.T) {
 	})
 }
 
-// Test node revival after failure
+// Test preveri, da se node po izpadu lahko oživi z novim Heartbeat-om.
+// Najprej pusti, da monitor označi node kot dead.
+// Nato pošlje heartbeat in pričakuje, da je node spet alive ter da je ponovno v chain.
 func TestNodeRevival(t *testing.T) {
 	cp := newControlPlane(200 * time.Millisecond)
 	ctx := context.Background()
 
-	// Add node
 	req := &pb.HeartbeatRequest{
 		NodeId:         "node-1",
 		Address:        "localhost:50051",
@@ -590,12 +597,10 @@ func TestNodeRevival(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// Start failure monitor
 	monitorCtx, monitorCancel := context.WithCancel(context.Background())
 	defer monitorCancel()
 	go cp.monitorFailuresLoop(monitorCtx)
 
-	// Wait for timeout (node becomes dead)
 	eventually(t, 2*time.Second, func() bool {
 		cp.lock.Lock()
 		defer cp.lock.Unlock()
@@ -603,7 +608,6 @@ func TestNodeRevival(t *testing.T) {
 		return st != nil && !st.alive
 	})
 
-	// Send heartbeat again (node revives)
 	_, err = cp.Heartbeat(ctx, req)
 	if err != nil {
 		t.Fatalf("Heartbeat failed: %v", err)
@@ -619,7 +623,9 @@ func TestNodeRevival(t *testing.T) {
 	})
 }
 
-// Test filterChain helper function
+// Test preveri helper filterChain, ki odstrani node iz verige po nodeID.
+// Vhodna chain ima tri node-e, odstranimo srednjega.
+// Rezultat mora imeti dolžino 2 in ohranjen vrstni red preostalih node-ov.
 func TestFilterChain(t *testing.T) {
 	chain := []*pb.NodeInfo{
 		{NodeId: "node-1", Address: "localhost:50051"},
@@ -640,7 +646,9 @@ func TestFilterChain(t *testing.T) {
 	}
 }
 
-// Test filterChain with non-existent node
+// Test preveri, da filterChain pri neobstoječem nodeID ne spremeni verige.
+// Vhod ima en node, filtriramo drugačen ID.
+// Rezultat mora ostati dolžine 1 in vsebovati isti node.
 func TestFilterChainNonExistent(t *testing.T) {
 	chain := []*pb.NodeInfo{
 		{NodeId: "node-1", Address: "localhost:50051"},
@@ -653,7 +661,9 @@ func TestFilterChainNonExistent(t *testing.T) {
 	}
 }
 
-// Test filterChain with empty chain
+// Test preveri, da filterChain na prazni verigi vrne prazno verigo.
+// S tem se izognemo edge-case napakam pri praznem inputu.
+// Pričakujemo dolžino 0.
 func TestFilterChainEmpty(t *testing.T) {
 	chain := []*pb.NodeInfo{}
 
@@ -664,7 +674,9 @@ func TestFilterChainEmpty(t *testing.T) {
 	}
 }
 
-// Test inChain helper function
+// Test preveri helper inChain, ki ugotovi ali nodeID obstaja v chain.
+// Ročno nastavi verigo z dvema node-oma in preveri true/false za tri različne ID-je.
+// To je osnova za appendToChainIfMissing in preprečevanje duplikatov.
 func TestInChain(t *testing.T) {
 	cp := newControlPlane(2 * time.Second)
 
@@ -684,14 +696,15 @@ func TestInChain(t *testing.T) {
 	}
 }
 
-// Test appendToChainIfMissing
+// Test preveri appendToChainIfMissing, da doda nov node in ignorira duplikat.
+// Najprej doda info1 in pričakuje changed=true, nato ponovno doda info1 in pričakuje changed=false.
+// Nato doda info2 in potrdi, da se chain podaljša na 2.
 func TestAppendToChainIfMissing(t *testing.T) {
 	cp := newControlPlane(2 * time.Second)
 
 	info1 := &pb.NodeInfo{NodeId: "node-1", Address: "localhost:50051"}
 	info2 := &pb.NodeInfo{NodeId: "node-2", Address: "localhost:50052"}
 
-	// Append new node
 	changed := cp.appendToChainIfMissing(info1)
 	if !changed {
 		t.Error("expected changed=true when adding new node")
@@ -700,7 +713,6 @@ func TestAppendToChainIfMissing(t *testing.T) {
 		t.Errorf("expected chain length 1, got %d", len(cp.chain))
 	}
 
-	// Append duplicate node
 	changed = cp.appendToChainIfMissing(info1)
 	if changed {
 		t.Error("expected changed=false when adding duplicate node")
@@ -709,7 +721,6 @@ func TestAppendToChainIfMissing(t *testing.T) {
 		t.Errorf("expected chain length 1 (no duplicate), got %d", len(cp.chain))
 	}
 
-	// Append another new node
 	changed = cp.appendToChainIfMissing(info2)
 	if !changed {
 		t.Error("expected changed=true when adding new node")
@@ -719,7 +730,9 @@ func TestAppendToChainIfMissing(t *testing.T) {
 	}
 }
 
-// Test concurrent heartbeats
+// Test preveri varnost pred race conditions pri sočasnih Heartbeat klicih.
+// Zažene več gorutin, ki vse pošiljajo heartbeat za isti node z različnimi vrednostmi.
+// Na koncu mora obstajati natanko en node v nodes mapi in v chain ne sme biti več kot en vnos.
 func TestConcurrentHeartbeats(t *testing.T) {
 	cp := newControlPlane(2 * time.Second)
 	ctx := context.Background()
@@ -755,7 +768,9 @@ func TestConcurrentHeartbeats(t *testing.T) {
 	}
 }
 
-// Test concurrent joins
+// Test preveri varnost pred race conditions pri sočasnih Join klicih za več različnih node-ov.
+// Zažene več gorutin, ki se hkrati prijavljajo z različnimi ID-ji.
+// Na koncu mora nodes mapa vsebovati pričakovano število node-ov.
 func TestConcurrentJoins(t *testing.T) {
 	cp := newControlPlane(2 * time.Second)
 	ctx := context.Background()
@@ -788,7 +803,9 @@ func TestConcurrentJoins(t *testing.T) {
 	}
 }
 
-// Test getHeadTailLocked with single node
+// Test preveri getHeadTailLocked pri verigi z enim node-om.
+// Head in tail morata biti isti node.
+// S tem pokrijemo edge-case, kjer ima chain dolžino 1.
 func TestGetHeadTailLockedSingle(t *testing.T) {
 	cp := newControlPlane(2 * time.Second)
 
@@ -806,7 +823,9 @@ func TestGetHeadTailLockedSingle(t *testing.T) {
 	}
 }
 
-// Test getHeadTailLocked with multiple nodes
+// Test preveri getHeadTailLocked pri verigi z več node-i.
+// Head mora biti prvi in tail zadnji element.
+// To potrdi, da se head/tail vedno računa iz trenutnega vrstnega reda.
 func TestGetHeadTailLockedMultiple(t *testing.T) {
 	cp := newControlPlane(2 * time.Second)
 
@@ -826,12 +845,13 @@ func TestGetHeadTailLockedMultiple(t *testing.T) {
 	}
 }
 
-// Test auto-join via heartbeat
+// Test preveri auto-join vedenje, ko node pošlje Heartbeat brez predhodnega Join.
+// Heartbeat mora ustvariti nodeStatus, označiti alive=true in dodati node v chain.
+// To je pomembno za scenarije, kjer se node ponovno zažene in takoj začne pošiljati heartbeat-e.
 func TestAutoJoinViaHeartbeat(t *testing.T) {
 	cp := newControlPlane(2 * time.Second)
 	ctx := context.Background()
 
-	// Node sends heartbeat without joining first
 	req := &pb.HeartbeatRequest{
 		NodeId:         "node-1",
 		Address:        "localhost:50051",
@@ -846,7 +866,6 @@ func TestAutoJoinViaHeartbeat(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// Node should be auto-joined
 	if len(cp.nodes) != 1 {
 		t.Errorf("expected 1 node (auto-joined), got %d", len(cp.nodes))
 	}
@@ -858,12 +877,13 @@ func TestAutoJoinViaHeartbeat(t *testing.T) {
 	}
 }
 
-// Test Leave updates head and tail
+// Test preveri, da Leave posodobi head in tail v response-u, ko odstranimo trenutni head.
+// Najprej naredi chain s tremi node-i, nato odstrani node-1.
+// Pričakuje, da postane node-2 novi head in node-3 ostane tail.
 func TestLeaveUpdatesHeadTail(t *testing.T) {
 	cp := newControlPlane(2 * time.Second)
 	ctx := context.Background()
 
-	// Join multiple nodes
 	nodes := []string{"node-1", "node-2", "node-3"}
 	for i, nodeID := range nodes {
 		req := &pb.JoinRequest{
@@ -878,7 +898,6 @@ func TestLeaveUpdatesHeadTail(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// Remove head node
 	resp, err := cp.Leave(ctx, &pb.LeaveRequest{NodeId: "node-1"})
 	if err != nil {
 		t.Fatalf("Leave failed: %v", err)
@@ -894,12 +913,13 @@ func TestLeaveUpdatesHeadTail(t *testing.T) {
 	}
 }
 
-// Test ConfigureChain doesn't make non-running servers available for load balancing
+// Test preveri, da ConfigureChain ne naredi node-ov razpoložljivih za load balancing brez Heartbeat-a.
+// Po ConfigureChain so node-i v chain, vendar morajo ostati alive=false.
+// Zato mora GetLeastLoadedNode vrniti "none".
 func TestConfigureChainDoesNotMakeServersAvailable(t *testing.T) {
 	cp := newControlPlane(2 * time.Second)
 	ctx := context.Background()
 
-	// ConfigureChain adds nodes to chain but marks them as not alive (no heartbeat)
 	nodes := []*pb.NodeInfo{
 		{NodeId: "node-1", Address: "localhost:50051"},
 		{NodeId: "node-2", Address: "localhost:50052"},
@@ -912,14 +932,12 @@ func TestConfigureChainDoesNotMakeServersAvailable(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// Nodes are in chain but not alive (no heartbeat received)
 	for _, node := range cp.nodes {
 		if node.alive {
 			t.Error("nodes configured via ConfigureChain should not be alive without heartbeat")
 		}
 	}
 
-	// GetLeastLoadedNode should return "none" because no servers are alive
 	resp, err := cp.GetLeastLoadedNode(ctx, &emptypb.Empty{})
 	if err != nil {
 		t.Fatalf("GetLeastLoadedNode failed: %v", err)
@@ -929,12 +947,13 @@ func TestConfigureChainDoesNotMakeServersAvailable(t *testing.T) {
 	}
 }
 
-// Test ConfigureChain with empty nodes list
+// Test preveri, da ConfigureChain z praznim seznamom node-ov pobriše obstoječo verigo.
+// Najprej doda en node prek Join, nato pokliče ConfigureChain z empty list.
+// Na koncu mora biti chain prazen.
 func TestConfigureChainEmpty(t *testing.T) {
 	cp := newControlPlane(2 * time.Second)
 	ctx := context.Background()
 
-	// First add some nodes
 	_, err := cp.Join(ctx, &pb.JoinRequest{NodeId: "node-1", Address: "localhost:50051"})
 	if err != nil {
 		t.Fatalf("Join failed: %v", err)
@@ -942,7 +961,6 @@ func TestConfigureChainEmpty(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// Now configure with empty list
 	_, err = cp.ConfigureChain(ctx, &pb.ConfigureChainRequest{Nodes: []*pb.NodeInfo{}})
 	if err != nil {
 		t.Fatalf("ConfigureChain failed: %v", err)
@@ -955,12 +973,13 @@ func TestConfigureChainEmpty(t *testing.T) {
 	}
 }
 
-// Test servers become available only after sending heartbeat
+// Test preveri, da server postane “na voljo” šele po Heartbeat-u, tudi če je v chain prek ConfigureChain.
+// Najprej konfigurira en node brez heartbeat-a in pričakuje, da GetLeastLoadedNode vrne "none".
+// Nato pošlje heartbeat in pričakuje, da se isti node vrne kot least loaded.
 func TestServersAvailableOnlyAfterHeartbeat(t *testing.T) {
 	cp := newControlPlane(2 * time.Second)
 	ctx := context.Background()
 
-	// ConfigureChain - servers in chain but not alive
 	nodes := []*pb.NodeInfo{
 		{NodeId: "node-1", Address: "localhost:50051"},
 	}
@@ -971,7 +990,6 @@ func TestServersAvailableOnlyAfterHeartbeat(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// Server not available for load balancing yet
 	resp, err := cp.GetLeastLoadedNode(ctx, &emptypb.Empty{})
 	if err != nil {
 		t.Fatalf("GetLeastLoadedNode failed: %v", err)
@@ -980,7 +998,6 @@ func TestServersAvailableOnlyAfterHeartbeat(t *testing.T) {
 		t.Errorf("expected 'none' before heartbeat, got %s", resp.GetNodeId())
 	}
 
-	// Now simulate running server sending heartbeat
 	heartbeat := &pb.HeartbeatRequest{
 		NodeId:         "node-1",
 		Address:        "localhost:50051",
@@ -994,7 +1011,6 @@ func TestServersAvailableOnlyAfterHeartbeat(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// Now server should be available
 	resp, err = cp.GetLeastLoadedNode(ctx, &emptypb.Empty{})
 	if err != nil {
 		t.Fatalf("GetLeastLoadedNode failed: %v", err)
@@ -1004,12 +1020,13 @@ func TestServersAvailableOnlyAfterHeartbeat(t *testing.T) {
 	}
 }
 
-// Test GetLeastLoadedNode with all dead nodes
+// Test preveri, da GetLeastLoadedNode vrne "none", ko so vsi node-i dead.
+// Node se najprej registrira prek heartbeat-a, nato monitorFailuresLoop označi node kot dead po timeoutu.
+// Po tem ne sme biti nobenega kandidata za load balancing.
 func TestGetLeastLoadedNodeAllDead(t *testing.T) {
 	cp := newControlPlane(100 * time.Millisecond)
 	ctx := context.Background()
 
-	// Add nodes
 	req := &pb.HeartbeatRequest{
 		NodeId:         "node-1",
 		Address:        "localhost:50051",
@@ -1023,7 +1040,6 @@ func TestGetLeastLoadedNodeAllDead(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// Start failure monitor
 	monitorCtx, monitorCancel := context.WithCancel(context.Background())
 	defer monitorCancel()
 	go cp.monitorFailuresLoop(monitorCtx)
@@ -1042,5 +1058,94 @@ func TestGetLeastLoadedNodeAllDead(t *testing.T) {
 
 	if resp.GetNodeId() != "none" {
 		t.Errorf("expected 'none' when all nodes are dead, got %s", resp.GetNodeId())
+	}
+}
+
+// Test preveri, da monitorFailuresLoop rebuilda chain izključno iz alive node-ov in ohrani njihov vrstni red.
+// Najprej auto-join-a tri node-e prek heartbeat-a, nato ohranja alive samo node-1 in node-3.
+// Ko node-2 postane dead, mora chain vsebovati [node-1, node-3] v tem vrstnem redu.
+func TestMonitorFailures_RebuildsChainPreservingOrderOfAliveNodes(t *testing.T) {
+	cp := newControlPlane(120 * time.Millisecond)
+	ctx := context.Background()
+
+	req1 := &pb.HeartbeatRequest{NodeId: "node-1", Address: "localhost:50051", LastAppliedSeq: 0, SubCount: 1}
+	req2 := &pb.HeartbeatRequest{NodeId: "node-2", Address: "localhost:50052", LastAppliedSeq: 0, SubCount: 1}
+	req3 := &pb.HeartbeatRequest{NodeId: "node-3", Address: "localhost:50053", LastAppliedSeq: 0, SubCount: 1}
+
+	_, _ = cp.Heartbeat(ctx, req1)
+	_, _ = cp.Heartbeat(ctx, req2)
+	_, _ = cp.Heartbeat(ctx, req3)
+
+	time.Sleep(30 * time.Millisecond)
+
+	monitorCtx, monitorCancel := context.WithCancel(context.Background())
+	defer monitorCancel()
+	go cp.monitorFailuresLoop(monitorCtx)
+
+	keepAliveCtx, keepAliveCancel := context.WithCancel(context.Background())
+	defer keepAliveCancel()
+
+	go func() {
+		ticker := time.NewTicker(40 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-keepAliveCtx.Done():
+				return
+			case <-ticker.C:
+				_, _ = cp.Heartbeat(ctx, req1)
+				_, _ = cp.Heartbeat(ctx, req3)
+			}
+		}
+	}()
+
+	eventually(t, 2*time.Second, func() bool {
+		cp.lock.Lock()
+		defer cp.lock.Unlock()
+
+		st2 := cp.nodes["node-2"]
+		if st2 == nil || st2.alive {
+			return false
+		}
+		if len(cp.chain) != 2 {
+			return false
+		}
+		return cp.chain[0].GetNodeId() == "node-1" && cp.chain[1].GetNodeId() == "node-3"
+	})
+}
+
+// Test preveri, da oživetje prek Heartbeat ne ustvari duplikatov v chain.
+// Najprej pusti, da node-1 postane dead in da ga monitor odstrani iz chain.
+// Nato pošlje heartbeat, ki mora node ponovno dodati, vendar chain mora ostati dolžine 1.
+func TestHeartbeatRevival_DoesNotDuplicateChainEntries(t *testing.T) {
+	cp := newControlPlane(120 * time.Millisecond)
+	ctx := context.Background()
+
+	req := &pb.HeartbeatRequest{NodeId: "node-1", Address: "localhost:50051", LastAppliedSeq: 0, SubCount: 1}
+	_, _ = cp.Heartbeat(ctx, req)
+	time.Sleep(20 * time.Millisecond)
+
+	monitorCtx, monitorCancel := context.WithCancel(context.Background())
+	defer monitorCancel()
+	go cp.monitorFailuresLoop(monitorCtx)
+
+	eventually(t, 2*time.Second, func() bool {
+		cp.lock.Lock()
+		defer cp.lock.Unlock()
+		st := cp.nodes["node-1"]
+		return st != nil && !st.alive
+	})
+
+	_, _ = cp.Heartbeat(ctx, req)
+	time.Sleep(50 * time.Millisecond)
+
+	cp.lock.Lock()
+	defer cp.lock.Unlock()
+
+	if len(cp.chain) != 1 {
+		t.Fatalf("expected chain length 1 after revival, got %d", len(cp.chain))
+	}
+	if cp.chain[0].GetNodeId() != "node-1" {
+		t.Fatalf("expected node-1 in chain, got %s", cp.chain[0].GetNodeId())
 	}
 }
