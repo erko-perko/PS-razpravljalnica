@@ -41,21 +41,18 @@ type messageBoardServer struct {
 
 	lock sync.RWMutex
 
-	// In-memory DB
 	users         map[int64]*pb.User
 	userNameToID  map[string]int64
 	topics        map[int64]*pb.Topic
-	messages      map[int64]map[int64]*pb.Message // topicID -> messageID -> Message
+	messages      map[int64]map[int64]*pb.Message
 	nextUserID    int64
 	nextTopicID   int64
 	nextMessageID map[int64]int64
 
-	// Subscription
 	subscribers map[int64]*subscription
 	nextSubID   int64
-	postEvents  map[int64]map[int64]*pb.MessageEvent // topicID -> messageID -> event backlog
+	postEvents  map[int64]map[int64]*pb.MessageEvent
 
-	// Chain state
 	nodeID      string
 	address     string
 	controlAddr string
@@ -70,32 +67,31 @@ type messageBoardServer struct {
 	successorConn   *grpc.ClientConn
 	successorClient pb.MessageBoardClient
 
-	// Sequence & log
 	nextSeq          int64
 	lastAppliedSeq   int64
 	lastCommittedSeq int64
 
-	logEntries map[int64]*pb.LogEntry // seq -> entry (all applied, committed or not)
+	logEntries map[int64]*pb.LogEntry
 
-	// Idempotency: request_id -> seq
 	requestToSeq map[string]int64
 
-	// Ack waiting at head: seq -> chan
 	ackLock     sync.Mutex
 	ackChannels map[int64]chan struct{}
 
-	// Load balancing for subscriptions at head
 	subCount atomic.Int64
 
-	// Token signing
 	tokenSecret []byte
 
-	// Head readiness gate (when a node becomes head after reconfiguration)
 	headReady atomic.Bool
 
 	pendingAcks map[int64]struct{}
 }
 
+/*
+newMessageBoardServer pripravi nov data-plane node z vsemi mapami in števci.
+Inicialno nastavi head/tail na samega sebe in omogoči “single-node” delovanje brez verige.
+Hkrati nastavi skrivnost za HMAC tokene in pripravi strukture za ack/idempotenca.
+*/
 func newMessageBoardServer(nodeID, address, controlAddr, tokenSecret string) *messageBoardServer {
 	s := &messageBoardServer{
 		users:         make(map[int64]*pb.User),
@@ -118,11 +114,14 @@ func newMessageBoardServer(nodeID, address, controlAddr, tokenSecret string) *me
 		pendingAcks:   make(map[int64]struct{}),
 	}
 	s.subCount.Store(0)
-	// If single node (initially), it's both head and tail, so head is ready.
 	s.headReady.Store(true)
 	return s
 }
 
+/*
+applyCommittedFlag označi entiteto, ki pripada seq številki, kot Committed=true.
+To omogoča, da tail vrača samo “potrjene” (konsistentne) rezultate za bralne RPC-je.
+*/
 func (s *messageBoardServer) applyCommittedFlag(seq int64) {
 	entry, ok := s.logEntries[seq]
 	if !ok {
@@ -155,6 +154,11 @@ func (s *messageBoardServer) applyCommittedFlag(seq int64) {
 	}
 }
 
+/*
+noteAck sprejme ack za seq in poskuša napredovati lastCommittedSeq po vrsti.
+Ack-i lahko pridejo out-of-order, zato pendingAcks hrani luknje, dokler ne pride vse zaporedno.
+Ko se commit premakne, označi tudi pripadajoče objekte kot committed.
+*/
 func (s *messageBoardServer) noteAck(seq int64) {
 	if seq <= s.lastCommittedSeq {
 		return
@@ -171,17 +175,30 @@ func (s *messageBoardServer) noteAck(seq int64) {
 	}
 }
 
+/*
+isHead pove ali ta node trenutno predstavlja head (write endpoint) verige.
+*/
 func (s *messageBoardServer) isHead() bool {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
 	return s.address == s.headAddress
 }
+
+/*
+isTail pove ali ta node trenutno predstavlja tail (read endpoint) verige.
+Bralni RPC-ji se izvajajo samo na tail, da vračajo committed podatke.
+*/
 func (s *messageBoardServer) isTail() bool {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
 	return s.address == s.tailAddress
 }
 
+/*
+requireHeadReady blokira write operacije, kadar je node pravkar postal head in še lovi stanje.
+To prepreči, da bi novi head sprejemal write-e, dokler ni catch-up končan.
+Stanje se upravlja z atomic headReady.
+*/
 func (s *messageBoardServer) requireHeadReady() error {
 	if !s.headReady.Load() {
 		return fmt.Errorf("head is not ready yet (catch-up in progress)")
@@ -189,11 +206,21 @@ func (s *messageBoardServer) requireHeadReady() error {
 	return nil
 }
 
+/*
+allocateSeqLocked dodeli naslednji seq za log entry in ga inkrementira.
+Kliče se samo pod s.lock, da se ohrani zaporednost in konsistentnost.
+Head uporablja seq za ordering in ack mehanizem.
+*/
 func (s *messageBoardServer) allocateSeqLocked() int64 {
 	s.nextSeq++
 	return s.nextSeq
 }
 
+/*
+prepareAck pripravi kanal, na katerem bo head čakal ack za določen seq.
+To omogoča “synchronous write”: write RPC se zaključi šele, ko pride ack nazaj.
+Metoda je thread-safe prek ackLock.
+*/
 func (s *messageBoardServer) prepareAck(seq int64) {
 	s.ackLock.Lock()
 	defer s.ackLock.Unlock()
@@ -203,6 +230,11 @@ func (s *messageBoardServer) prepareAck(seq int64) {
 	s.ackChannels[seq] = make(chan struct{}, 1)
 }
 
+/*
+waitAck čaka na ack signal za seq do timeouta.
+Ko se signal zgodi ali timeout poteče, cleanup-a ackChannels vnos.
+To je ključni del, ki write RPC-ju da deterministično “commit barrier” semantiko.
+*/
 func (s *messageBoardServer) waitAck(seq int64, timeout time.Duration) bool {
 	s.ackLock.Lock()
 	ch, ok := s.ackChannels[seq]
@@ -225,6 +257,11 @@ func (s *messageBoardServer) waitAck(seq int64, timeout time.Duration) bool {
 	}
 }
 
+/*
+signalAck sproži ack kanal za seq, če obstaja.
+Kliče se na head, ko ack propagira nazaj (ali v single-node primeru takoj po propagate).
+Pošiljanje je non-blocking zaradi buffered kanala.
+*/
 func (s *messageBoardServer) signalAck(seq int64) {
 	s.ackLock.Lock()
 	ch, ok := s.ackChannels[seq]
@@ -238,12 +275,15 @@ func (s *messageBoardServer) signalAck(seq int64) {
 	}
 }
 
+/*
+validateSeqLocked preveri, da se log entry-ji aplicirajo v strogo naraščajočem vrstnem redu.
+Duplikate (seq <= lastAppliedSeq) sprejme kot idempotentno ponovitev.
+Če pride out-of-order seq, vrne napako in s tem zadrži apliciranje.
+*/
 func (s *messageBoardServer) validateSeqLocked(seq int64) error {
-	// Accept duplicates (idempotent propagation); ignore if already applied.
 	if seq <= s.lastAppliedSeq {
 		return nil
 	}
-	// Must be exactly next
 	if seq != s.lastAppliedSeq+1 {
 		return fmt.Errorf("out of order: expected %d got %d", s.lastAppliedSeq+1, seq)
 	}
@@ -251,20 +291,22 @@ func (s *messageBoardServer) validateSeqLocked(seq int64) error {
 	return nil
 }
 
+/*
+applyEntryLocked aplicira log entry v lokalno stanje in ga shrani v logEntries.
+Je idempotenten: če seq že obstaja, entry ignorira, kar pomaga pri retry/jitter scenarijih.
+Poleg stanja (users/topics/messages) generira tudi subscription evente za relevantne operacije.
+*/
 func (s *messageBoardServer) applyEntryLocked(entry *pb.LogEntry) error {
 	seq := entry.GetSequenceNumber()
 
-	// If already applied, do nothing (idempotent).
 	if _, ok := s.logEntries[seq]; ok {
 		return nil
 	}
 
-	// Ensure order
 	if err := s.validateSeqLocked(seq); err != nil {
 		return err
 	}
 
-	// Store in log
 	s.logEntries[seq] = entry
 
 	switch entry.GetOp() {
@@ -273,7 +315,6 @@ func (s *messageBoardServer) applyEntryLocked(entry *pb.LogEntry) error {
 		if u == nil {
 			return fmt.Errorf("missing user in log entry")
 		}
-		// Enforce username uniqueness with map (idempotent safe)
 		if existingID, ok := s.userNameToID[u.GetName()]; ok {
 			if existingID != u.GetId() {
 				return fmt.Errorf("username taken")
@@ -417,7 +458,6 @@ func (s *messageBoardServer) applyEntryLocked(entry *pb.LogEntry) error {
 		return fmt.Errorf("unknown op %v", entry.GetOp())
 	}
 
-	// Track request_id -> seq for idempotency if present
 	rid := strings.TrimSpace(entry.GetRequestId())
 	if rid != "" {
 		s.requestToSeq[rid] = seq
@@ -426,6 +466,11 @@ func (s *messageBoardServer) applyEntryLocked(entry *pb.LogEntry) error {
 	return nil
 }
 
+/*
+newMessageEventLocked ustvari MessageEvent, ki ga subscription streami pošiljajo klientom.
+Event vsebuje seq, operacijo, referenco na message in timestamp nastanka eventa.
+Uporablja timestamppb.Now(), zato je čas eventa definiran na node-u, ki je entry apliciral.
+*/
 func (s *messageBoardServer) newMessageEventLocked(op pb.OpType, msg *pb.Message, seq int64) *pb.MessageEvent {
 	return &pb.MessageEvent{
 		SequenceNumber: seq,
@@ -435,6 +480,11 @@ func (s *messageBoardServer) newMessageEventLocked(op pb.OpType, msg *pb.Message
 	}
 }
 
+/*
+broadcastEventLocked best-effort pošlje event vsem subscriberjem, ki so naročeni na topic.
+Ne blokira na počasnih subscriberjih (default case v select), da ne zaustavi write poti.
+Metoda predpostavlja lock, ker iterira čez subscribers map.
+*/
 func (s *messageBoardServer) broadcastEventLocked(event *pb.MessageEvent) {
 	if event.GetMessage() == nil {
 		return
@@ -451,6 +501,11 @@ func (s *messageBoardServer) broadcastEventLocked(event *pb.MessageEvent) {
 	}
 }
 
+/*
+removeSubscription odstrani subscription iz serverja in zapre njegov kanal.
+To se kliče ob prekinitvi streama ali ob napakah pri Send().
+Poleg tega zmanjša subCount, ki ga control plane uporablja za load-balancing.
+*/
 func (s *messageBoardServer) removeSubscription(id int64) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
@@ -461,6 +516,11 @@ func (s *messageBoardServer) removeSubscription(id int64) {
 	}
 }
 
+/*
+requireNodeReady prepreči obdelavo internih chain RPC-jev, kadar node še ni sinhroniziran.
+Uporablja se predvsem po reconfiguration, ko node lovi predecessorja (catch-up).
+S tem se izogneš aplikaciji entry-jev na “pol-nastavljen” node.
+*/
 func (s *messageBoardServer) requireNodeReady() error {
 	if !s.headReady.Load() {
 		return fmt.Errorf("node is not ready yet (catch-up in progress)")
@@ -468,6 +528,11 @@ func (s *messageBoardServer) requireNodeReady() error {
 	return nil
 }
 
+/*
+getEntryByRequestIDLocked implementira idempotenco: request_id mapira na seq in log entry.
+Če entry obstaja, lahko write RPC vrne že ustvarjen rezultat brez ponovne aplikacije.
+Metoda predpostavlja s.lock, ker bere requestToSeq in logEntries.
+*/
 func (s *messageBoardServer) getEntryByRequestIDLocked(requestID string) (*pb.LogEntry, bool) {
 	seq, ok := s.requestToSeq[requestID]
 	if !ok {
@@ -477,6 +542,11 @@ func (s *messageBoardServer) getEntryByRequestIDLocked(requestID string) (*pb.Lo
 	return entry, ok
 }
 
+/*
+propagateToSuccessor pošlje entry na successor node preko gRPC.
+Če successor client ne obstaja, je to legalno samo na tail-u (kjer propagation konča).
+Uporablja RLock, da minimalno blokira ostale operacije.
+*/
 func (s *messageBoardServer) propagateToSuccessor(ctx context.Context, entry *pb.LogEntry) error {
 	s.lock.RLock()
 	client := s.successorClient
@@ -494,6 +564,11 @@ func (s *messageBoardServer) propagateToSuccessor(ctx context.Context, entry *pb
 	return err
 }
 
+/*
+reportNodeFailure je best-effort obvestilo control plane-u, da je node (običajno successor) verjetno nedosegljiv.
+To pospeši reconfiguration, ker CP lahko odstrani node iz chain-a in pushne novo topologijo.
+Če controlAddr ni nastavljen ali dial odpove, metoda tiho konča.
+*/
 func (s *messageBoardServer) reportNodeFailure(nodeID string) {
 	if strings.TrimSpace(s.controlAddr) == "" {
 		return
@@ -510,6 +585,11 @@ func (s *messageBoardServer) reportNodeFailure(nodeID string) {
 	_, _ = client.Leave(ctx, &pb.LeaveRequest{NodeId: nodeID})
 }
 
+/*
+propagateWithRetry poskuša večkrat poslati entry successorju z eksponentnim backoffom.
+Ob napaki poroča failure control plane-u, da se chain preveže, nato pa retry-a.
+Če context poteče ali retries iztečejo, vrne zadnjo napako kot failure.
+*/
 func (s *messageBoardServer) propagateWithRetry(ctx context.Context, entry *pb.LogEntry, maxRetries int) error {
 	var lastErr error
 	for i := 0; i < maxRetries; i++ {
@@ -524,13 +604,11 @@ func (s *messageBoardServer) propagateWithRetry(ctx context.Context, entry *pb.L
 		s.lock.RUnlock()
 		if succ != nil {
 			log.Printf("[%s] propagate failed (%d/%d) to succ=%s: %v", s.nodeID, i+1, maxRetries, succ.GetNodeId(), err)
-			// Best-effort failure report (helps CP remove dead node and rewire chain)
 			s.reportNodeFailure(succ.GetNodeId())
 		} else {
 			log.Printf("[%s] propagate failed (%d/%d) no successor: %v", s.nodeID, i+1, maxRetries, err)
 		}
 
-		// backoff + allow chain reconfiguration to arrive
 		backoff := time.Duration(1<<uint(i)) * 200 * time.Millisecond
 		if backoff > 2*time.Second {
 			backoff = 2 * time.Second
@@ -544,6 +622,11 @@ func (s *messageBoardServer) propagateWithRetry(ctx context.Context, entry *pb.L
 	return fmt.Errorf("propagation failed after %d retries: %v", maxRetries, lastErr)
 }
 
+/*
+sendAckToPredecessor pošlje Ack RPC proti head-u, korak za korakom po verigi nazaj.
+To se kliče na tail-u (in vmesnih node-ih), ko je seq potrjen, da se commit signal vrne do head-a.
+Metoda je best-effort in ignorira napake, da ack pot ne blokira aplikacije.
+*/
 func (s *messageBoardServer) sendAckToPredecessor(ctx context.Context, seq int64) {
 	s.lock.RLock()
 	pred := s.predecessor
@@ -560,6 +643,11 @@ func (s *messageBoardServer) sendAckToPredecessor(ctx context.Context, seq int64
 	_, _ = client.Ack(ctx, &pb.AckRequest{SequenceNumber: seq})
 }
 
+/*
+catchUpFromPredecessor sinhronizira manjkajoče log entry-je od predecessorja preko SyncFrom.
+To je ključno, ko se node pridruži verigi ali ko se predecessor spremeni po failure/reconfig.
+Če node po reconfiguration postane head, se po catch-up-u označi headReady=true.
+*/
 func (s *messageBoardServer) catchUpFromPredecessor() {
 	s.lock.RLock()
 	pred := s.predecessor
@@ -605,13 +693,17 @@ func (s *messageBoardServer) catchUpFromPredecessor() {
 	s.lock.Unlock()
 
 	if isHead {
-		// After catch-up, head is ready to accept writes.
 		s.headReady.Store(true)
 	}
 
 	log.Printf("[%s] catch-up complete up to %d", s.nodeID, s.lastAppliedSeq)
 }
 
+/*
+heartbeatLoop periodično pošilja Heartbeat control plane-u z lastAppliedSeq, naslovom in subCount.
+To daje CP-ju signal, da je node živ, in omogoča failure detection ter subscription load-balancing.
+Če controlAddr ni nastavljen, loop sploh ne teče.
+*/
 func (s *messageBoardServer) heartbeatLoop() {
 	if strings.TrimSpace(s.controlAddr) == "" {
 		return
@@ -645,6 +737,11 @@ func (s *messageBoardServer) heartbeatLoop() {
 	}
 }
 
+/*
+joinControlPlane po zagonu node-a izvede Join RPC na control plane.
+CP vrne trenutno chain konfiguracijo, ki se aplicira z applyChainConfig.
+Če join odpove, node še vedno teče, vendar brez koordinirane topologije.
+*/
 func (s *messageBoardServer) joinControlPlane() {
 	if strings.TrimSpace(s.controlAddr) == "" {
 		return
@@ -671,6 +768,11 @@ func (s *messageBoardServer) joinControlPlane() {
 	}
 }
 
+/*
+applyChainConfig aplicira novo topologijo: nastavi head/tail in izračuna predecessor/successor.
+Ob spremembi successorja resetira povezavo in postavi nov gRPC client za propagation.
+Če node postane head ali se predecessor spremeni, sproži catch-up in ustrezno upravlja headReady.
+*/
 func (s *messageBoardServer) applyChainConfig(nodes []*pb.NodeInfo) error {
 	s.lock.Lock()
 
@@ -682,7 +784,6 @@ func (s *messageBoardServer) applyChainConfig(nodes []*pb.NodeInfo) error {
 
 	s.chain = nodes
 	if len(nodes) == 0 {
-		// standalone
 		s.headAddress = s.address
 		s.tailAddress = s.address
 		s.predecessor = nil
@@ -700,7 +801,6 @@ func (s *messageBoardServer) applyChainConfig(nodes []*pb.NodeInfo) error {
 	s.headAddress = nodes[0].GetAddress()
 	s.tailAddress = nodes[len(nodes)-1].GetAddress()
 
-	// Find index
 	myIndex := -1
 	for i, n := range nodes {
 		if n.GetNodeId() == s.nodeID {
@@ -709,7 +809,6 @@ func (s *messageBoardServer) applyChainConfig(nodes []*pb.NodeInfo) error {
 		}
 	}
 	if myIndex == -1 {
-		// Not in chain anymore - treat as standalone
 		s.predecessor = nil
 		s.successor = nil
 		s.headAddress = s.address
@@ -735,7 +834,6 @@ func (s *messageBoardServer) applyChainConfig(nodes []*pb.NodeInfo) error {
 	s.predecessor = newPred
 	s.successor = newSucc
 
-	// Reset successor client connection if changed
 	if s.successorConn != nil {
 		_ = s.successorConn.Close()
 		s.successorConn = nil
@@ -752,26 +850,21 @@ func (s *messageBoardServer) applyChainConfig(nodes []*pb.NodeInfo) error {
 		s.successorClient = pb.NewMessageBoardClient(conn)
 	}
 
-	// Head readiness logic:
-	// If we became head, we must catch up first (if we have predecessor).
 	becameHead := (oldHead != s.headAddress && s.address == s.headAddress)
 	if becameHead {
 		s.headReady.Store(false)
 	}
-	// If predecessor changed, catch up.
+
 	needCatchUp := predChanged
 	if becameHead && s.predecessor != nil {
 		needCatchUp = true
 	}
 	if becameHead && s.predecessor == nil {
-		// Head with no predecessor -> immediately ready.
 		s.headReady.Store(true)
 	} else if !becameHead && predChanged && s.predecessor == nil {
-		// Predecessor disappeared → node is effectively head now
 		s.headReady.Store(true)
 	}
 
-	// unlock scope ends here; do catch-up async outside lock
 	newPredAddr := ""
 	if s.predecessor != nil {
 		newPredAddr = s.predecessor.GetAddress()
@@ -782,7 +875,6 @@ func (s *messageBoardServer) applyChainConfig(nodes []*pb.NodeInfo) error {
 		s.predecessor != nil, s.successor != nil, predChanged, becameHead, oldPredAddr, newPredAddr)
 
 	needCatchUpLocal := needCatchUp
-
 	s.lock.Unlock()
 
 	if needCatchUpLocal {
@@ -792,10 +884,11 @@ func (s *messageBoardServer) applyChainConfig(nodes []*pb.NodeInfo) error {
 	return nil
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// External API (head writes)
-////////////////////////////////////////////////////////////////////////////////
-
+/*
+CreateUser je write RPC, dovoljen izključno na head node-u in šele, ko je headReady.
+Implementira idempotenca prek request_id, zato ponovni klic vrne isti rezultat brez duplikatov.
+Po local apply replicira entry po verigi, v single-node primeru pa sam sproži ack signal.
+*/
 func (s *messageBoardServer) CreateUser(ctx context.Context, request *pb.CreateUserRequest) (*pb.User, error) {
 	if !s.isHead() {
 		return nil, fmt.Errorf("write operations only allowed at head node")
@@ -851,7 +944,6 @@ func (s *messageBoardServer) CreateUser(ctx context.Context, request *pb.CreateU
 	if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
 		return nil, err
 	}
-	// Single-node chain: head is also tail, so there will be no external Ack RPC.
 	if s.isTail() {
 		s.signalAck(seq)
 	}
@@ -866,6 +958,11 @@ func (s *messageBoardServer) CreateUser(ctx context.Context, request *pb.CreateU
 	return resp, nil
 }
 
+/*
+CreateTopic je write RPC za dodajanje teme, dovoljen samo na head node-u.
+Idempotenca prek request_id omogoča varne retry-je brez podvajanja tem.
+Po repliciranju čaka na ack; v single-node verigi se ack signal sproži lokalno.
+*/
 func (s *messageBoardServer) CreateTopic(ctx context.Context, request *pb.CreateTopicRequest) (*pb.Topic, error) {
 	if !s.isHead() {
 		return nil, fmt.Errorf("write operations only allowed at head node")
@@ -917,7 +1014,6 @@ func (s *messageBoardServer) CreateTopic(ctx context.Context, request *pb.Create
 	if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
 		return nil, err
 	}
-	// Single-node chain: head is also tail, so there will be no external Ack RPC.
 	if s.isTail() {
 		s.signalAck(seq)
 	}
@@ -932,6 +1028,11 @@ func (s *messageBoardServer) CreateTopic(ctx context.Context, request *pb.Create
 	return resp, nil
 }
 
+/*
+PostMessage je write RPC za objavo sporočila v temo, dovoljen samo na head-u.
+idempotenca prek request_id prepreči duplikate sporočil ob retry-jih.
+Po local apply replicira entry in nato čaka na ack; v single-node verigi se ack sproži lokalno.
+*/
 func (s *messageBoardServer) PostMessage(ctx context.Context, request *pb.PostMessageRequest) (*pb.Message, error) {
 	if !s.isHead() {
 		return nil, fmt.Errorf("write operations only allowed at head node")
@@ -956,7 +1057,6 @@ func (s *messageBoardServer) PostMessage(ctx context.Context, request *pb.PostMe
 			return nil, fmt.Errorf("stored entry missing message")
 		}
 
-		// Prefer current state if present, otherwise return snapshot from log entry.
 		if tm, ok := s.messages[m.GetTopicId()]; ok {
 			if resp, ok := tm[m.GetId()]; ok {
 				s.lock.Unlock()
@@ -1013,7 +1113,6 @@ func (s *messageBoardServer) PostMessage(ctx context.Context, request *pb.PostMe
 	if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
 		return nil, err
 	}
-	// Single-node chain: head is also tail, so there will be no external Ack RPC.
 	if s.isTail() {
 		s.signalAck(seq)
 	}
@@ -1028,6 +1127,11 @@ func (s *messageBoardServer) PostMessage(ctx context.Context, request *pb.PostMe
 	return resp, nil
 }
 
+/*
+UpdateMessage je write RPC za urejanje sporočila, dovoljen samo na head-u.
+Preveri obstoj uporabnika in lastništvo sporočila (avtor mora biti isti user).
+idempotenca prek request_id omogoča varne retry-je, nato pa replicira in čaka na ack.
+*/
 func (s *messageBoardServer) UpdateMessage(ctx context.Context, request *pb.UpdateMessageRequest) (*pb.Message, error) {
 	if !s.isHead() {
 		return nil, fmt.Errorf("write operations only allowed at head node")
@@ -1052,7 +1156,6 @@ func (s *messageBoardServer) UpdateMessage(ctx context.Context, request *pb.Upda
 			return nil, fmt.Errorf("stored entry missing message")
 		}
 
-		// Prefer current state if present, otherwise return snapshot from log entry.
 		if tm, ok := s.messages[m.GetTopicId()]; ok {
 			if resp, ok := tm[m.GetId()]; ok {
 				s.lock.Unlock()
@@ -1114,7 +1217,6 @@ func (s *messageBoardServer) UpdateMessage(ctx context.Context, request *pb.Upda
 	if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
 		return nil, err
 	}
-	// Single-node chain: head is also tail, so there will be no external Ack RPC.
 	if s.isTail() {
 		s.signalAck(seq)
 	}
@@ -1129,6 +1231,11 @@ func (s *messageBoardServer) UpdateMessage(ctx context.Context, request *pb.Upda
 	return resp, nil
 }
 
+/*
+DeleteMessage je write RPC za brisanje sporočila, dovoljen samo na head-u.
+Preveri, da je user avtor sporočila, in podpira idempotenca prek request_id.
+Po local apply replicira entry in čaka na ack; rezultat je prazen (Empty).
+*/
 func (s *messageBoardServer) DeleteMessage(ctx context.Context, request *pb.DeleteMessageRequest) (*emptypb.Empty, error) {
 	if !s.isHead() {
 		return nil, fmt.Errorf("write operations only allowed at head node")
@@ -1196,7 +1303,6 @@ func (s *messageBoardServer) DeleteMessage(ctx context.Context, request *pb.Dele
 	if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
 		return nil, err
 	}
-	// Single-node chain: head is also tail, so there will be no external Ack RPC.
 	if s.isTail() {
 		s.signalAck(seq)
 	}
@@ -1210,6 +1316,11 @@ func (s *messageBoardServer) DeleteMessage(ctx context.Context, request *pb.Dele
 	return &emptypb.Empty{}, nil
 }
 
+/*
+LikeMessage je write RPC za povečanje “likes” na sporočilu, dovoljen samo na head-u.
+Podpira idempotenca prek request_id, zato ponovitve ne povečajo likes večkrat.
+Po local apply replicira entry in čaka na ack, nato vrne posodobljeno sporočilo.
+*/
 func (s *messageBoardServer) LikeMessage(ctx context.Context, request *pb.LikeMessageRequest) (*pb.Message, error) {
 	if !s.isHead() {
 		return nil, fmt.Errorf("write operations only allowed at head node")
@@ -1230,7 +1341,6 @@ func (s *messageBoardServer) LikeMessage(ctx context.Context, request *pb.LikeMe
 			return nil, fmt.Errorf("stored entry missing message")
 		}
 
-		// Prefer current state if present, otherwise return snapshot from log entry.
 		if tm, ok := s.messages[m.GetTopicId()]; ok {
 			if resp, ok := tm[m.GetId()]; ok {
 				s.lock.Unlock()
@@ -1287,7 +1397,6 @@ func (s *messageBoardServer) LikeMessage(ctx context.Context, request *pb.LikeMe
 	if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
 		return nil, err
 	}
-	// Single-node chain: head is also tail, so there will be no external Ack RPC.
 	if s.isTail() {
 		s.signalAck(seq)
 	}
@@ -1302,10 +1411,11 @@ func (s *messageBoardServer) LikeMessage(ctx context.Context, request *pb.LikeMe
 	return resp, nil
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Reads (tail only)
-////////////////////////////////////////////////////////////////////////////////
-
+/*
+ListTopics je read RPC, dovoljen samo na tail node-u, da so podatki konsistentni.
+Vrne samo teme, ki so committed, in jih sortira po ID naraščajoče.
+Če node ni tail, vrne napako, da klient ne bere iz “nepotrjenega” stanja.
+*/
 func (s *messageBoardServer) ListTopics(ctx context.Context, _ *emptypb.Empty) (*pb.ListTopicsResponse, error) {
 	if !s.isTail() {
 		return nil, fmt.Errorf("read operations only allowed at tail node")
@@ -1323,6 +1433,11 @@ func (s *messageBoardServer) ListTopics(ctx context.Context, _ *emptypb.Empty) (
 	return out, nil
 }
 
+/*
+GetMessages je read RPC, dovoljen samo na tail node-u.
+Podpira paging z fromMessageId in limit, ter vrača samo committed sporočila.
+Sporočila se vrnejo v naraščajočem vrstnem redu po ID.
+*/
 func (s *messageBoardServer) GetMessages(ctx context.Context, request *pb.GetMessagesRequest) (*pb.GetMessagesResponse, error) {
 	if !s.isTail() {
 		return nil, fmt.Errorf("read operations only allowed at tail node")
@@ -1360,10 +1475,11 @@ func (s *messageBoardServer) GetMessages(ctx context.Context, request *pb.GetMes
 	return out, nil
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Subscription load balancing (head)
-////////////////////////////////////////////////////////////////////////////////
-
+/*
+GetSubscriptionNode je head-only RPC, ki izbere node za SubscribeTopic na osnovi subCount (least loaded).
+Head še vedno generira podpisan token, s katerim lahko klient odpre stream na kateremkoli node-u.
+Če CP ni dosegljiv, metoda kot fallback vrne head samega.
+*/
 func (s *messageBoardServer) GetSubscriptionNode(ctx context.Context, request *pb.SubscriptionNodeRequest) (*pb.SubscriptionNodeResponse, error) {
 	if !s.isHead() {
 		return nil, fmt.Errorf("subscription routing only allowed at head node")
@@ -1392,11 +1508,9 @@ func (s *messageBoardServer) GetSubscriptionNode(ctx context.Context, request *p
 
 	node, err := cpClient.GetLeastLoadedNode(cpCtx, &emptypb.Empty{})
 	if err != nil || node == nil || node.GetAddress() == "" {
-		// fallback: head sam
 		node = &pb.NodeInfo{NodeId: s.nodeID, Address: s.address}
 	}
 
-	// token še vedno podpiše head
 	token, err := s.makeSubscribeToken(request.GetUserId(), request.GetTopicId(), time.Now().Add(10*time.Minute).Unix())
 	if err != nil {
 		return nil, err
@@ -1408,8 +1522,12 @@ func (s *messageBoardServer) GetSubscriptionNode(ctx context.Context, request *p
 	}, nil
 }
 
+/*
+SubscribeTopic je streaming RPC, ki po validaciji tokena najprej pošlje backlog committed eventov.
+Nato posluša live evente in jih, če še niso committed, bufferira ter periodično flush-a, ko ack napreduje.
+S tem klient ne izgubi dogodkov, ki so nastali pred commit-om, in vseeno prejme samo committed rezultate.
+*/
 func (s *messageBoardServer) SubscribeTopic(request *pb.SubscribeTopicRequest, stream pb.MessageBoard_SubscribeTopicServer) error {
-	// validate token (works on any node)
 	topicsFromToken, err := s.validateSubscribeToken(request.GetSubscribeToken(), request.GetUserId())
 	if err != nil {
 		return err
@@ -1472,9 +1590,6 @@ func (s *messageBoardServer) SubscribeTopic(request *pb.SubscribeTopicRequest, s
 		}
 	}
 
-	// Live events are produced when entries are applied, but they may arrive before
-	// they are committed (acknowledged from tail). If we drop them here, the client
-	// will never see them. Buffer until committed and then flush in sequence order.
 	pending := make(map[int64]*pb.MessageEvent)
 	flushPending := func() error {
 		s.lock.RLock()
@@ -1536,7 +1651,6 @@ func (s *messageBoardServer) SubscribeTopic(request *pb.SubscribeTopicRequest, s
 					s.removeSubscription(subID)
 					return err
 				}
-				// Opportunistically flush any earlier pending committed events.
 				if err := flushPending(); err != nil {
 					s.removeSubscription(subID)
 					return err
@@ -1544,7 +1658,6 @@ func (s *messageBoardServer) SubscribeTopic(request *pb.SubscribeTopicRequest, s
 				continue
 			}
 
-			// Not committed yet: buffer until ack advances.
 			if _, exists := pending[seq]; !exists {
 				pending[seq] = ev
 			}
@@ -1552,10 +1665,11 @@ func (s *messageBoardServer) SubscribeTopic(request *pb.SubscribeTopicRequest, s
 	}
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Internal chain RPCs
-////////////////////////////////////////////////////////////////////////////////
-
+/*
+PropagateEntry je interni chain RPC, s katerim node sprejme log entry od predecessorja.
+Entry se aplicira lokalno in nato forward-a successorju; retry logika omogoča preživetje ob failure/reconfig.
+Če je node tail, zabeleži ack in sproži ack pot nazaj proti head-u.
+*/
 func (s *messageBoardServer) PropagateEntry(ctx context.Context, entry *pb.LogEntry) (*emptypb.Empty, error) {
 	if err := s.requireNodeReady(); err != nil {
 		return nil, err
@@ -1569,11 +1683,8 @@ func (s *messageBoardServer) PropagateEntry(ctx context.Context, entry *pb.LogEn
 	hasSucc := s.successorClient != nil
 	s.lock.Unlock()
 
-	// Forward to successor with retry (lets CP rewire chain on failure)
 	if hasSucc {
 		if err := s.propagateWithRetry(ctx, entry, 5); err != nil {
-			// If we cannot forward and we're not tail, caller should retry after chain reconfig.
-			// We still keep the entry locally; it will be forwarded once successor changes.
 			return nil, err
 		}
 	}
@@ -1588,6 +1699,11 @@ func (s *messageBoardServer) PropagateEntry(ctx context.Context, entry *pb.LogEn
 	return &emptypb.Empty{}, nil
 }
 
+/*
+Ack je interni chain RPC, ki prenaša commit signal nazaj proti head-u.
+Vsak node napreduje lastCommittedSeq (noteAck) in če je head, zbudi čakajoči write prek signalAck.
+Če node ni head, posreduje ack predecessorju.
+*/
 func (s *messageBoardServer) Ack(ctx context.Context, request *pb.AckRequest) (*emptypb.Empty, error) {
 	seq := request.GetSequenceNumber()
 
@@ -1605,12 +1721,22 @@ func (s *messageBoardServer) Ack(ctx context.Context, request *pb.AckRequest) (*
 	return &emptypb.Empty{}, nil
 }
 
+/*
+GetLastApplied je pomožni RPC za diagnostiko in sinhronizacijo, ki vrne lastAppliedSeq.
+Uporaben je za vpogled v napredovanje node-a in pri debugiranju chain stanja.
+Ker je read-only, uporablja RLock.
+*/
 func (s *messageBoardServer) GetLastApplied(ctx context.Context, _ *pb.GetLastAppliedRequest) (*pb.GetLastAppliedResponse, error) {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
 	return &pb.GetLastAppliedResponse{LastAppliedSeq: s.lastAppliedSeq}, nil
 }
 
+/*
+SyncFrom vrne vse log entry-je z seq > fromSeqExclusive v pravilnem vrstnem redu.
+To je osnova za catch-up, ko se node priklopi ali ko se po reconfiguration zamenja predecessor.
+Metoda je read-only in uporablja RLock za varno iteracijo po logEntries.
+*/
 func (s *messageBoardServer) SyncFrom(ctx context.Context, request *pb.SyncFromRequest) (*pb.SyncFromResponse, error) {
 	from := request.GetFromSeqExclusive()
 	s.lock.RLock()
@@ -1631,10 +1757,11 @@ func (s *messageBoardServer) SyncFrom(ctx context.Context, request *pb.SyncFromR
 	return out, nil
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Control plane -> node chain configuration
-////////////////////////////////////////////////////////////////////////////////
-
+/*
+ConfigureChain je RPC, ki ga control plane kliče ob spremembi topologije verige.
+Node aplicira novo verigo prek applyChainConfig in po potrebi sproži catch-up.
+S tem CP centralno distribuira head/tail/pred/succ spremembe na vse node-e.
+*/
 func (s *messageBoardServer) ConfigureChain(ctx context.Context, request *pb.ConfigureChainRequest) (*emptypb.Empty, error) {
 	if err := s.applyChainConfig(request.GetNodes()); err != nil {
 		return nil, err
@@ -1642,10 +1769,11 @@ func (s *messageBoardServer) ConfigureChain(ctx context.Context, request *pb.Con
 	return &emptypb.Empty{}, nil
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Token helpers (HMAC signed)
-////////////////////////////////////////////////////////////////////////////////
-
+/*
+makeSubscribeToken ustvari HMAC podpisan token (payload + signature) za subscribe routing.
+Payload vsebuje userID, seznam topicov in exp timestamp, signature pa prepreči ponarejanje.
+Token generira head, da imajo vsi node-i enoten način validacije.
+*/
 func (s *messageBoardServer) makeSubscribeToken(userID int64, topics []int64, exp int64) (string, error) {
 	payload := tokenPayload{UserID: userID, Topics: append([]int64(nil), topics...), Exp: exp}
 	raw, err := json.Marshal(payload)
@@ -1657,6 +1785,11 @@ func (s *messageBoardServer) makeSubscribeToken(userID int64, topics []int64, ex
 	return b64 + "." + sig, nil
 }
 
+/*
+validateSubscribeToken preveri format, podpis, userID in veljavnost (exp) tokena.
+Če token ni veljaven, vrne generično napako, da ne razkriva podrobnosti napadalcu.
+Ob uspehu vrne seznam topicov, na katere se klient sme naročiti.
+*/
 func (s *messageBoardServer) validateSubscribeToken(token string, userID int64) ([]int64, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 2 {
@@ -1684,16 +1817,22 @@ func (s *messageBoardServer) validateSubscribeToken(token string, userID int64) 
 	return p.Topics, nil
 }
 
+/*
+sign izračuna HMAC-SHA256 podpis nad data in ga vrne kot base64url string.
+S tem se zagotovi integriteta token payload-a in prepreči spremembe brez skrivnosti.
+Ključ (tokenSecret) mora biti enak na vseh node-ih.
+*/
 func (s *messageBoardServer) sign(data []byte) string {
 	mac := hmac.New(sha256.New, s.tokenSecret)
 	_, _ = mac.Write(data)
 	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// main
-////////////////////////////////////////////////////////////////////////////////
-
+/*
+main inicializira gRPC server za en data-plane node in začne poslušati na izbranem portu.
+Ob zagonu se node priključi control plane-u (Join) in začne periodično pošiljati heartbeate.
+To je “entry point”, ki poveže vse komponente: RPC handlerje, chain konfiguracijo in membership.
+*/
 func main() {
 	nodeID := flag.String("n", "node-1", "node ID")
 	port := flag.Int("a", 50051, "listen port")
@@ -1713,7 +1852,6 @@ func main() {
 	grpcServer := grpc.NewServer()
 	pb.RegisterMessageBoardServer(grpcServer, s)
 
-	// Start join + heartbeat
 	s.joinControlPlane()
 	go s.heartbeatLoop()
 
